@@ -1189,6 +1189,7 @@ import crypto from "crypto";
 var PG_HARDCODED = { url: "postgresql://neondb_owner:npg_yU5dcF4VLoAI@ep-restless-dew-babvncvj-pooler.c-8.eu-central-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require" };
 var pgActive = false;
 var pool = null;
+var INSTANCE_ID = crypto.randomBytes(6).toString("hex") + "_" + process.pid;
 var md5 = (s) => crypto.createHash("md5").update(s).digest("hex");
 var clean = (json) => json.includes("\\u0000") ? json.replace(/\\u0000/g, "") : json;
 var jstr = (v) => clean(JSON.stringify(v === void 0 ? null : v));
@@ -1490,9 +1491,24 @@ function schedule(ms) {
     else go();
   }, ms);
 }
-function pgQueueState(get) {
+function pgQueueState(get, immediate = false) {
   if (!pgActive) return;
   getDb = get;
+  if (immediate) {
+    if (stateTimer) {
+      clearTimeout(stateTimer);
+      stateTimer = null;
+    }
+    const go = async () => {
+      stateRunning = runState().finally(() => {
+        stateRunning = null;
+      });
+      await stateRunning;
+    };
+    if (stateRunning) stateRunning.then(go);
+    else go();
+    return;
+  }
   schedule(STATE_DELAY_MS);
 }
 var matchTimers = /* @__PURE__ */ new Map();
@@ -1502,6 +1518,87 @@ async function writeMatch(id, m) {
     `INSERT INTO matches (id, data, updated_at) VALUES ($1, $2::jsonb, now()) ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, updated_at = now()`,
     [id, jstr(m)]
   );
+}
+async function pgWriteMatchNow(id, m) {
+  if (!pgActive) return;
+  const t = matchTimers.get(id);
+  if (t) clearTimeout(t);
+  matchTimers.delete(id);
+  pendingMatches.delete(id);
+  try {
+    await writeMatch(id, m);
+  } catch (e) {
+    console.error("PostgreSQL: немедленная запись матча", id, e.message);
+    pgQueueMatch(id, () => m);
+  }
+}
+async function pgFetchMatch(id) {
+  if (!pgActive) return null;
+  try {
+    const r = await q(`SELECT data FROM matches WHERE id = $1`, [id]);
+    return r.rowCount ? r.rows[0].data : null;
+  } catch {
+    return null;
+  }
+}
+function pgMarkFixtureSynced(id, fObj) {
+  try {
+    const prev = lastSynced.get("fixtures");
+    if (!prev || !fObj) return;
+    const oldEntry = prev.get(id);
+    const pos = oldEntry ? oldEntry.pos : 0;
+    const json = jstr(fObj);
+    prev.set(id, { pos, json, h: md5(pos + "|" + json) });
+  } catch {
+  }
+}
+async function pgTryClaimFixture(id, instanceId, opts: { allowStatuses?: string[]; staleMs?: number } = {}) {
+  if (!pgActive) return { claimed: true, remote: null };
+  const allowStatuses = opts.allowStatuses || ["scheduled", "queued"];
+  const staleMs = Number(opts.staleMs) || 18e4;
+  const now = Date.now();
+  const staleBefore = now - staleMs;
+  try {
+    const r = await q(
+      `UPDATE fixtures
+       SET data = jsonb_set(
+         jsonb_set(
+           jsonb_set(data, '{status}', '"generating"'::jsonb),
+           '{_ownerId}', to_jsonb($2::text)
+         ),
+         '{_ownerAt}', to_jsonb($3::bigint)
+       )
+       WHERE id = $1
+         AND (
+           (data->>'status') = ANY($4::text[])
+           OR (
+             (data->>'status') IN ('generating', 'live')
+             AND (
+               (data->>'_ownerId') = $2
+               OR COALESCE(NULLIF(data->>'_ownerAt', '')::bigint, 0) < $5::bigint
+             )
+           )
+         )
+       RETURNING data`,
+      [id, instanceId, now, allowStatuses, staleBefore]
+    );
+    if (r.rowCount > 0) return { claimed: true, remote: r.rows[0].data };
+    const cur = await q(`SELECT data FROM fixtures WHERE id = $1`, [id]);
+    if (!cur.rowCount) return { claimed: true, remote: null };
+    return { claimed: false, remote: cur.rows[0].data };
+  } catch (e) {
+    console.error("PostgreSQL: ошибка блокировки матча", id, e.message);
+    return { claimed: true, remote: null };
+  }
+}
+function pgRefreshOwner(id, instanceId) {
+  if (!pgActive) return;
+  const now = Date.now();
+  q(
+    `UPDATE fixtures SET data = jsonb_set(data, '{_ownerAt}', to_jsonb($3::bigint)) WHERE id = $1 AND (data->>'_ownerId') = $2`,
+    [id, instanceId, now]
+  ).catch(() => {
+  });
 }
 function pgQueueMatch(id, get) {
   if (!pgActive) return;
@@ -1515,7 +1612,7 @@ function pgQueueMatch(id, get) {
     try {
       await writeMatch(id, g());
     } catch (e) {
-      console.error("PostgreSQL: \u0437\u0430\u043F\u0438\u0441\u044C \u043C\u0430\u0442\u0447\u0430", id, e.message, "\u2014 \u043F\u043E\u0432\u0442\u043E\u0440\u044E");
+      console.error("PostgreSQL: запись матча", id, e.message, "— повторю");
       if (!pendingMatches.has(id)) {
         pendingMatches.set(id, g);
         matchTimers.set(id, setTimeout(() => {
@@ -1535,7 +1632,7 @@ async function pgDeleteMatch(id) {
   try {
     await q(`DELETE FROM matches WHERE id = $1`, [id]);
   } catch (e) {
-    console.error("PostgreSQL: \u0443\u0434\u0430\u043B\u0435\u043D\u0438\u0435 \u043C\u0430\u0442\u0447\u0430:", e.message);
+    console.error("PostgreSQL: удаление матча:", e.message);
   }
 }
 async function pgDeleteAllMatches() {
@@ -6113,8 +6210,11 @@ function save() {
   if (saveT) return;
   saveT = setTimeout(saveNow, 250);
 }
-function saveNow() {
-  saveT = null;
+function saveNow(immediatePg = false) {
+  if (saveT) {
+    clearTimeout(saveT);
+    saveT = null;
+  }
   try {
     if (db && Array.isArray(db.fixtures)) {
       for (const f of db.fixtures) {
@@ -6123,7 +6223,7 @@ function saveNow() {
     }
     db._savedAt = Date.now();
     if (pgActive) {
-      pgQueueState(() => db);
+      pgQueueState(() => db, immediatePg);
       return;
     }
     fs3.writeFileSync(DB_FILE + ".tmp", JSON.stringify(db));
@@ -6149,6 +6249,14 @@ var putMatch = (id, m) => {
   mcache.set(id, m);
   if (pgActive) {
     pgQueueMatch(id, () => m);
+    return;
+  }
+  fs3.writeFileSync(path3.join(MDIR, id + ".json"), JSON.stringify(m));
+};
+var putMatchNow = async (id, m) => {
+  mcache.set(id, m);
+  if (pgActive) {
+    await pgWriteMatchNow(id, m);
     return;
   }
   fs3.writeFileSync(path3.join(MDIR, id + ".json"), JSON.stringify(m));
@@ -10220,9 +10328,23 @@ ${esc(f.note)}`);
   }
   return true;
 }
+var OWNER_STALE_MS = 12e4;
+function isOwnedByOtherInstance(f) {
+  if (!pgActive || !f || !f._ownerId || f._ownerId === INSTANCE_ID) return false;
+  return Date.now() - Number(f._ownerAt || 0) < OWNER_STALE_MS;
+}
+function syncFixtureFromRemote(f, remote) {
+  if (!f || !remote || typeof remote !== "object") return;
+  for (const k of ["status", "hg", "ag", "final", "pen", "st", "pos", "hold", "motm", "err", "note", "fallback", "aiCalls", "_ownerId", "_ownerAt"]) {
+    if (remote[k] !== void 0) f[k] = remote[k];
+  }
+  pgMarkFixtureSynced(f.id, f);
+}
 function enqueue(id, force = false, manual = true) {
   const f = fx(id);
   if (!f || f.status !== "scheduled") return;
+  if (isOwnedByOtherInstance(f)) return;
+  if (queue.some((j) => j.id === id)) return;
   if (!force && db.settings.techDefeat === true && f.comp !== FRIENDLY_COMP) {
     if (manual || Date.now() >= realAt(f).getTime()) {
       const pr = { home: techProblems(f, f.home), away: techProblems(f, f.away) };
@@ -10248,7 +10370,7 @@ function enqueue(id, force = false, manual = true) {
     f.autoRetryAt = 0;
     f.noAuto = false;
   }
-  save();
+  if (!pgActive) save();
   queue.push({ id, manual });
   pumpQ();
 }
@@ -10265,15 +10387,41 @@ function pumpQ() {
 async function runMatch(id, opts = {}) {
   const f = fx(id);
   if (!f) return;
+  if (f.status !== "scheduled" && f.status !== "queued") return;
+  if (pgActive) {
+    const claim = await pgTryClaimFixture(id, INSTANCE_ID, { allowStatuses: ["scheduled", "queued"], staleMs: OWNER_STALE_MS });
+    if (!claim.claimed) {
+      if (claim.remote) {
+        syncFixtureFromRemote(f, claim.remote);
+        if (claim.remote.status === "done") {
+          const rm = await pgFetchMatch(id);
+          if (rm) mcache.set(id, rm);
+          invalidateAgg();
+        }
+      }
+      return;
+    }
+  }
+  const curBefore = fx(id);
+  if (!curBefore || curBefore.status === "done" || curBefore.status === "live") return;
+  const genToken = uid();
+  f._genToken = genToken;
+  f._ownerId = INSTANCE_ID;
+  f._ownerAt = Date.now();
   f.status = "generating";
   f.err = "";
   f.aiCalls = 0;
   f.hold = null;
-  save();
+  saveNow(true);
   const store = { ai: true, calls: 0, cap: +db.settings.maxAiCalls || 6 };
   await aiCtx.run(store, async () => {
+    const stillValid = () => {
+      const cf = fx(id);
+      return !!cf && cf._genToken === genToken && cf.status === "generating";
+    };
     try {
       const ctx = await buildCtx(f);
+      if (!stillValid()) return;
       const light = isLightFx(f);
       let events = [], note = "", fallback = false, lightStats = null;
       if (light) {
@@ -10285,28 +10433,35 @@ async function runMatch(id, opts = {}) {
       } else {
         const periods = db.settings.chunks == 6 ? [[1, 15], [16, 30], [31, 45], [46, 60], [61, 75], [76, 90]] : [[1, 45], [46, 90]];
         for (const [a2, b] of periods) {
+          if (!stillValid()) return;
+          f._ownerAt = Date.now();
+          pgRefreshOwner(id, INSTANCE_ID);
           const r = await genPeriod(a2, b, ctx, events, note);
           events = events.concat(r.events);
           note = r.note;
           fallback = fallback || !!r.fallback;
         }
       }
+      if (!stillValid()) return;
       events.forEach((e, i) => e.i = i);
       const [h, a] = rescore(events);
       f.aiCalls = store.calls;
       f.err = "";
       f.autoRetries = 0;
       f.autoRetryAt = 0;
-      putMatch(id, { events, ctx, fallback, light, lightStats });
       f.final = [h, a];
       f.hg = 0;
       f.ag = 0;
       f.pos = 0;
       f.fallback = !!fallback;
+      f._ownerId = INSTANCE_ID;
+      f._ownerAt = Date.now();
+      await putMatchNow(id, { events, ctx, fallback, light, lightStats });
+      if (!stillValid()) return;
       if (light) {
         f.pos = events.length;
         if (note) f.note = note;
-        save();
+        saveNow(true);
         finish(id);
         return;
       }
@@ -10317,20 +10472,27 @@ async function runMatch(id, opts = {}) {
         if (waitMs > 2147483647) {
           f.status = "scheduled";
           f.hold = null;
-          save();
+          f._genToken = null;
+          f._ownerId = null;
+          f._ownerAt = 0;
+          saveNow(true);
           return;
         }
         f.hold = startAt;
-        save();
+        saveNow(true);
         if (timers[id]) clearTimeout(timers[id]);
         timers[id] = setTimeout(() => beginLive(id), waitMs);
       } else {
         beginLive(id);
       }
     } catch (e: any) {
-      console.error("\u043C\u0430\u0442\u0447 \u043D\u0435 \u0443\u0434\u0430\u043B\u0441\u044F:", e);
+      if (!stillValid()) return;
+      console.error("матч не удалось сгенерировать:", e);
       f.aiCalls = store.calls;
       f.status = "scheduled";
+      f._genToken = null;
+      f._ownerId = null;
+      f._ownerAt = 0;
       f.err = e.message;
       if (!opts.manual) {
         f.autoRetries = (f.autoRetries || 0) + 1;
@@ -10341,35 +10503,63 @@ async function runMatch(id, opts = {}) {
           f.autoRetryAt = Date.now() + f.autoRetries * 3e4;
         }
       }
-      save();
+      saveNow(true);
     }
   });
 }
 function beginLive(id) {
+  if (timers[id]) {
+    clearTimeout(timers[id]);
+    delete timers[id];
+  }
   const f = fx(id);
   if (!f || f.status !== "generating" || !getMatch(id)) return;
   f.hold = null;
   f.status = "live";
-  save();
+  f._ownerId = INSTANCE_ID;
+  f._ownerAt = Date.now();
+  saveNow(true);
   startLive(id);
 }
 function startLive(id) {
+  if (timers[id]) {
+    clearTimeout(timers[id]);
+    delete timers[id];
+  }
   const f = fx(id), m = getMatch(id);
+  if (!f || !m || !Array.isArray(m.events) || f.status === "done") return;
+  f._ownerId = INSTANCE_ID;
+  f._ownerAt = Date.now();
+  let lastOwnerPing = Date.now();
   live[id] ||= { clients: /* @__PURE__ */ new Set() };
   if (f.pos === 0) {
-    tg(`\u{1F3DF} <b>${esc(tn(f.home))} \u2014 ${esc(tn(f.away))}</b>
+    tg(`🏟 <b>${esc(tn(f.home))} — ${esc(tn(f.away))}</b>
 ${esc(compName(f))}, ${esc(roundLabel(f))}
-\u0422\u0440\u0430\u043D\u0441\u043B\u044F\u0446\u0438\u044F \u043D\u0430\u0447\u0430\u043B\u0430\u0441\u044C${db.settings.siteUrl ? `: ${esc(db.settings.siteUrl)}/#/match/${id}` : ""}`);
+Трансляция началась${db.settings.siteUrl ? `: ${esc(db.settings.siteUrl)}/#/match/${id}` : ""}`);
   }
   const step = () => {
-    if (f.pos >= m.events.length) return finish(id);
-    const e = m.events[f.pos++];
-    f.hg = e.score[0];
-    f.ag = e.score[1];
+    const curF = fx(id);
+    if (!curF || curF.status !== "live") {
+      if (timers[id]) {
+        clearTimeout(timers[id]);
+        delete timers[id];
+      }
+      return;
+    }
+    const now = Date.now();
+    curF._ownerAt = now;
+    if (now - lastOwnerPing >= 25e3) {
+      lastOwnerPing = now;
+      pgRefreshOwner(id, INSTANCE_ID);
+    }
+    if (curF.pos >= m.events.length) return finish(id);
+    const e = m.events[curF.pos++];
+    curF.hg = e.score[0];
+    curF.ag = e.score[1];
     pushLive(id, { type: "event", e });
-    tgEvent(f, e);
+    tgEvent(curF, e);
     save();
-    const nx = m.events[f.pos];
+    const nx = m.events[curF.pos];
     const d = computeLiveEventDelayMs(e, nx, db.settings);
     timers[id] = setTimeout(step, d);
   };
@@ -10382,9 +10572,28 @@ function pushLive(id, obj) {
   for (const r of l.clients) r.write(s);
 }
 function finish(id) {
+  if (timers[id]) {
+    clearTimeout(timers[id]);
+    delete timers[id];
+  }
   const f = fx(id), m = getMatch(id);
-  f.hg = f.final[0];
-  f.ag = f.final[1];
+  if (!f || !m || f.status === "done") return;
+  if (Array.isArray(m.events) && m.events.length > 0) {
+    const [rh, ra] = rescore(m.events);
+    f.final = [rh, ra];
+    f.hg = rh;
+    f.ag = ra;
+    f.pos = m.events.length;
+  } else if (Array.isArray(f.final) && f.final.length >= 2) {
+    f.hg = Number(f.final[0]) || 0;
+    f.ag = Number(f.final[1]) || 0;
+  } else {
+    f.hg = Number(f.hg) || 0;
+    f.ag = Number(f.ag) || 0;
+    f.final = [f.hg, f.ag];
+  }
+  f.hold = null;
+  f._genToken = null;
   f.st = computeStats(m.events, m.ctx);
   if (m.light) applyLightStats(f.st, m.lightStats, m.ctx);
   m.stats = f.st;
@@ -10393,7 +10602,7 @@ function finish(id) {
   m.ratings = computeMatchRatings(m, f, HName, AName);
   m.motm = getMatchMotm(m, f, HName, AName, cH, cA);
   if (m.motm) f.motm = { pid: m.motm.pid, name: m.motm.name, pos: m.motm.pos, teamId: m.motm.teamId, teamName: m.motm.teamName, rating: m.motm.rating };
-  putMatch(id, m);
+  void putMatchNow(id, m);
   if ((f.comp === "cup" || f.comp === "supercup") && f.hg === f.ag && !f.pen) f.pen = shootout(f);
   checkPlayoffShootout(f);
   f.status = "done";
@@ -10524,20 +10733,20 @@ function finish(id) {
       console.error("\u041E\u0448\u0438\u0431\u043A\u0430 \u0441\u043E\u0437\u0434\u0430\u043D\u0438\u044F \u0438\u043D\u0441\u0430\u0439\u0434\u0430/\u042D\u0421\u041A \u043F\u043E\u0441\u043B\u0435 \u043C\u0430\u0442\u0447\u0430:", err);
     }
   }
-  save();
+  saveNow(true);
   if (!isFriendlyMatch) checkForeignInterestAfterMatch(db, m, f).then((newOffers) => {
     if (newOffers && newOffers.length > 0) {
       save();
       for (const o of newOffers) {
-        tg(`\u{1F30D} <b>\u0422\u0440\u0430\u043D\u0441\u0444\u0435\u0440\u043D\u044B\u0439 \u0438\u043D\u0442\u0435\u0440\u0435\u0441 \u0438\u0437-\u0437\u0430 \u0440\u0443\u0431\u0435\u0436\u0430!</b>
-\u041A\u043B\u0443\u0431 \xAB${esc(o.buyerClub)}\xBB (${esc(o.buyerCountry)}) \u0441\u0434\u0435\u043B\u0430\u043B \u043E\u0444\u0438\u0446\u0438\u0430\u043B\u044C\u043D\u043E\u0435 \u043F\u0440\u0435\u0434\u043B\u043E\u0436\u0435\u043D\u0438\u0435 \u043F\u043E \u0438\u0433\u0440\u043E\u043A\u0443 <b>${esc(o.playerName)}</b> (\xAB${esc(o.clubName)}\xBB) \u043D\u0430 \u0441\u0443\u043C\u043C\u0443 <b>${esc(o.fee)}</b>!
-<i>\xAB${esc(o.scoutReport)}\xBB</i>`);
+        tg(`🌍 <b>Трансферный интерес из-за рубежа!</b>
+Клуб «${esc(o.buyerClub)}» (${esc(o.buyerCountry)}) сделал официальное предложение по игроку <b>${esc(o.playerName)}</b> («${esc(o.clubName)}») на сумму <b>${esc(o.fee)}</b>!
+<i>«${esc(o.scoutReport)}»</i>`);
       }
     }
-  }).catch((err) => console.error("\u041E\u0448\u0438\u0431\u043A\u0430 \u043F\u0440\u043E\u0432\u0435\u0440\u043A\u0438 \u0441\u043A\u0430\u0443\u0442\u043E\u0432:", err));
+  }).catch((err) => console.error("Ошибка проверки скаутов:", err));
   const st = f.st;
-  tg(`\u{1F3C1} <b>\u0418\u0442\u043E\u0433: ${esc(tn(f.home))} ${f.hg}:${f.ag} ${esc(tn(f.away))}</b>${f.pen ? ` (\u043F\u0435\u043D. ${f.pen.hg}:${f.pen.ag})` : ""}
-\u0412\u043B\u0430\u0434\u0435\u043D\u0438\u0435 ${st.poss[0]}\u2013${st.poss[1]}, \u0443\u0434\u0430\u0440\u044B ${st.teams.home.sh}\u2013${st.teams.away.sh}, xG ${st.teams.home.xg}\u2013${st.teams.away.xg}${db.settings.siteUrl ? `
+  tg(`🏁 <b>Итог: ${esc(tn(f.home))} ${f.hg}:${f.ag} ${esc(tn(f.away))}</b>${f.pen ? ` (пен. ${f.pen.hg}:${f.pen.ag})` : ""}
+Владение ${st.poss[0]}–${st.poss[1]}, удары ${st.teams.home.sh}–${st.teams.away.sh}, xG ${st.teams.home.xg}–${st.teams.away.xg}${db.settings.siteUrl ? `
 ${esc(db.settings.siteUrl)}/#/match/${id}` : ""}`);
   pushLive(id, { type: "end" });
   delete timers[id];
@@ -10568,24 +10777,43 @@ function checkPlayoffShootout(f) {
   }
 }
 function resumeLive() {
+  let touched = false;
   for (const f of db.fixtures) {
-    if (f.status === "live" && getMatch(f.id)) startLive(f.id);
-    else if (f.status === "generating" && f.hold && getMatch(f.id)?.events?.length) {
+    if (!["live", "generating", "queued"].includes(f.status)) continue;
+    if (isOwnedByOtherInstance(f)) continue;
+    if (f.status === "live" && getMatch(f.id)) {
+      f._ownerId = INSTANCE_ID;
+      f._ownerAt = Date.now();
+      pgRefreshOwner(f.id, INSTANCE_ID);
+      startLive(f.id);
+      touched = true;
+    } else if (f.status === "generating" && f.hold && getMatch(f.id)?.events?.length) {
       const fid = f.id;
       const waitMs = Math.max(0, f.hold - Date.now());
       if (waitMs > 2147483647) {
         f.status = "scheduled";
         f.hold = null;
+        f._ownerId = null;
+        f._ownerAt = 0;
+        touched = true;
       } else {
+        f._ownerId = INSTANCE_ID;
+        f._ownerAt = Date.now();
+        pgRefreshOwner(f.id, INSTANCE_ID);
         if (timers[fid]) clearTimeout(timers[fid]);
         timers[fid] = setTimeout(() => beginLive(fid), waitMs);
+        touched = true;
       }
-    } else if (["live", "generating", "queued"].includes(f.status)) {
+    } else {
       f.status = "scheduled";
       f.hold = null;
+      f._genToken = null;
+      f._ownerId = null;
+      f._ownerAt = 0;
+      touched = true;
     }
   }
-  save();
+  if (touched) save();
 }
 var tgQ = [];
 var tgBusy = false;
@@ -16805,10 +17033,14 @@ app.post("/api/admin/fixture", admin, (req, res) => {
   const f = fx(req.body.id);
   if (!f) return fail(res, "\u041C\u0430\u0442\u0447 \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D");
   if (req.body.reset) {
-    if (f.status === "live" || f.hold) {
+    if (timers[f.id]) {
       clearTimeout(timers[f.id]);
+      delete timers[f.id];
     }
-    Object.assign(f, { status: "scheduled", hg: null, ag: null, pen: null, st: null, pos: 0, final: null, err: "", hold: null, aiCalls: 0, noAuto: false, autoRetries: 0, autoRetryAt: 0 });
+    for (let qi = queue.length - 1; qi >= 0; qi--) {
+      if (queue[qi]?.id === f.id) queue.splice(qi, 1);
+    }
+    Object.assign(f, { status: "scheduled", hg: null, ag: null, pen: null, st: null, pos: 0, final: null, err: "", hold: null, aiCalls: 0, noAuto: false, autoRetries: 0, autoRetryAt: 0, _genToken: null, _ownerId: null, _ownerAt: 0 });
     try {
       fs3.unlinkSync(path3.join(MDIR, f.id + ".json"));
     } catch {
@@ -16817,13 +17049,24 @@ app.post("/api/admin/fixture", admin, (req, res) => {
     mcache.delete(f.id);
     invalidateAgg();
     if (f.comp === "cup") advanceCup();
-    save();
+    saveNow(true);
     return res.json({ ok: 1, fixture: pubFx(f) });
   }
   if (req.body.hg !== void 0 && req.body.ag !== void 0) {
-    if (f.status !== "scheduled" && !req.body.force) return fail(res, "\u041C\u0430\u0442\u0447 \u0443\u0436\u0435 \u0441\u044B\u0433\u0440\u0430\u043D");
+    if (f.status !== "scheduled" && !req.body.force) return fail(res, "Матч уже сыгран");
+    if (timers[f.id]) {
+      clearTimeout(timers[f.id]);
+      delete timers[f.id];
+    }
+    for (let qi = queue.length - 1; qi >= 0; qi--) {
+      if (queue[qi]?.id === f.id) queue.splice(qi, 1);
+    }
+    f._genToken = null;
+    f._ownerId = null;
+    f._ownerAt = 0;
     f.hg = +req.body.hg;
     f.ag = +req.body.ag;
+    f.final = [f.hg, f.ag];
     f.status = "done";
     f.st = null;
     if ((f.comp === "cup" || f.comp === "supercup") && f.hg === f.ag) f.pen = shootout(f);
@@ -20164,7 +20407,11 @@ function runAutoStartTick() {
   const now = Date.now(), lead = (db.settings.aiLeadSec !== void 0 ? +db.settings.aiLeadSec : 60) * 1e3;
   for (const f of db.fixtures || []) {
     if (f.season && f.season !== S()) continue;
+    if (isOwnedByOtherInstance(f)) continue;
     if (f.status === "generating" && f.hold && !timers[f.id] && getMatch(f.id)?.events?.length) {
+      f._ownerId = INSTANCE_ID;
+      f._ownerAt = now;
+      pgRefreshOwner(f.id, INSTANCE_ID);
       const waitMs = Math.max(0, f.hold - now);
       if (waitMs <= 1e3) beginLive(f.id);
       else if (waitMs <= 2147483647) timers[f.id] = setTimeout(() => beginLive(f.id), waitMs);
@@ -20236,6 +20483,7 @@ export {
   SYS_DEFAULT,
   app,
   assignFormationSlots,
+  beginLive,
   buildCtx,
   buildDrawTournamentBrief,
   buildFallbackDrawScript,
@@ -20247,18 +20495,22 @@ export {
   computeStats,
   db,
   determineSuperCupTeams,
+  enqueue,
   ensureDualTimes,
   ensureSuperCupFixture,
   evaluatePositionFit,
   fakePeriod,
   fatText,
+  finish,
   fixLineup,
   formationSlots,
+  fx,
   generateDrawAiScript,
   getAvailableSeasons,
   getCupWinnerForSeason,
   getCurrentGameDate,
   getLineup,
+  getMatch,
   getMatchMotm,
   getPreviousSeason,
   getSuperCupVenue,
@@ -20269,6 +20521,12 @@ export {
   normalizeEvents,
   normalizeLoanUntil,
   normalizePlannedSubs,
+  putMatch,
   realAt,
-  runAutoStartTick
+  rescore,
+  resumeLive,
+  runAutoStartTick,
+  runMatch,
+  startLive
 };
+
