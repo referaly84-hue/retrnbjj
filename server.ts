@@ -4865,7 +4865,17 @@ try {
     }
   ],
   "state_at_end": {
-    "momentum_note": "Краткая сводка хода игры к концу отрезка"
+    "momentum_note": "Краткая сводка хода игры к концу отрезка",
+    "energy_spent": {
+      "Имя Фамилия игрока (ТОЛЬКО в концовке матча к 90+ минуте)": {
+        "spent": "целое число 0..60 (% затраченной энергии за матч ПО ПРОДЕЛАННОЙ РАБОТЕ, а не по времени; ВР — 3..12%, спокойный защитник — 10..18%, активный полевой — 18..42%, выход на замену в конце — 3..14%)",
+        "reason": "коротко почему (напр.: стоял в воротах без рывков / пахал в прессинге / спокойно отыграл сзади)"
+      }
+    },
+    "referee_eval": {
+      "rating": "оценка главному судье ЗА ЭТОТ МАТЧ от 5.0 до 9.5 (ТОЛЬКО в концовке матча к 90+ минуте; отличное судейство топ-матча: 8.2–8.9, ровный матч: 7.7–8.2, ошибки/потеря контроля: 5.5–7.1)",
+      "summary": "коротко почему (1 предложение по ключевым решениям, дисциплине и ВАР)"
+    }
   }
 }
 
@@ -5806,6 +5816,24 @@ function classifyMatchTier(f) {
   }
   return { tier: "mid", label: "Обычный матч", reason: "Стандартный матч тура", avgPower: +avgPow.toFixed(1) };
 }
+function getRefereeSeedRating(r) {
+  if (!r) return 7.4;
+  const def = (typeof DEFAULT_REFEREES !== "undefined" && Array.isArray(DEFAULT_REFEREES))
+    ? DEFAULT_REFEREES.find((x) => (r.id && x.id === r.id) || (r.name && x.name === r.name))
+    : null;
+  if (def && Number(def.rating) > 0) return Number(def.rating);
+  if (Number(r.seedRating) > 0) return Number(r.seedRating);
+  return 7.4;
+}
+function getRefereeEffectiveSkill(r) {
+  if (!r) return 7.4;
+  const seedR = getRefereeSeedRating(r);
+  const curR = Number(r.rating || 0);
+  const m = Number(r.matches || 0);
+  if (m >= 3 && curR > 0) return +(curR * 0.6 + seedR * 0.4).toFixed(2);
+  if (curR > 0) return +(curR * 0.35 + seedR * 0.65).toFixed(2);
+  return seedR;
+}
 function assignTourReferees(tourList, force = false) {
   const validMatches = tourList.filter((f) => f.comp === "rpl" || f.comp === "cup");
   const invalidMatches = tourList.filter((f) => f.comp !== "rpl" && f.comp !== "cup");
@@ -5821,14 +5849,59 @@ function assignTourReferees(tourList, force = false) {
   }
   if (!validMatches.length || !db?.referees?.length) return;
   const isLocked = (f) => {
-    if (force) return false;
-    if (f.manualReferees) return true;
     if (f.status === "done" || f.status === "live") return true;
+    if (force) return !!f.manualReferees && f.manualReferees === "keep";
+    if (f.manualReferees) return true;
     return !!(f.refereeId && f.refereeName && Array.isArray(f.assistants) && f.assistants.length >= 2 && f.reserveReferee && f.varReferee && f.avarReferee);
   };
+  const unlockedIds = new Set(validMatches.filter((f) => !isLocked(f)).map((f) => f.id));
   const usedHeadIds = /* @__PURE__ */ new Set();
   for (const f of validMatches) {
     if (isLocked(f) && f.refereeId) usedHeadIds.add(f.refereeId);
+  }
+  const curSeason = validMatches[0].season || S();
+  const tourDates = validMatches.map((f) => String(f.date || "")).filter(Boolean).sort();
+  const tourDateMin = tourDates[0] || "";
+  const parseDayNum = (d) => {
+    if (!d || !/^\d{4}-\d{2}-\d{2}$/.test(d)) return NaN;
+    return Math.floor(new Date(d + "T12:00:00Z").getTime() / 86400000);
+  };
+  const tourDayMin = parseDayNum(tourDateMin);
+  const headLoad = {};
+  const varLoad = {};
+  const resLoad = {};
+  const lastHeadDay = {};
+  const refById = new Map();
+  const refByName = new Map();
+  for (const r of db.referees) {
+    headLoad[r.id] = 0;
+    varLoad[r.name] = 0;
+    resLoad[r.name] = 0;
+    refById.set(r.id, r);
+    refByName.set(r.name, r);
+  }
+  const compRoundPairs = /* @__PURE__ */ new Set();
+  const curTourKey = getFixtureTourKey(validMatches[0]);
+  const prevCompRound = validMatches[0].comp === "rpl" && Number(validMatches[0].round) > 1 ? `${curSeason}:rpl:${Number(validMatches[0].round) - 1}` : null;
+  const prevTourHeadIds = /* @__PURE__ */ new Set();
+  for (const fxItem of db.fixtures || []) {
+    if ((fxItem.season || S()) !== curSeason) continue;
+    if (fxItem.comp !== "rpl" && fxItem.comp !== "cup") continue;
+    if (unlockedIds.has(fxItem.id)) continue;
+    const isCounted = fxItem.status === "done" || fxItem.status === "live" || !!(fxItem.refereeId || fxItem.refereeName);
+    if (!isCounted) continue;
+    const hr = fxItem.refereeId ? refById.get(fxItem.refereeId) : refByName.get(fxItem.refereeName);
+    if (hr) {
+      headLoad[hr.id] = (headLoad[hr.id] || 0) + 1;
+      const dNum = parseDayNum(fxItem.date);
+      if (Number.isFinite(dNum) && (!Number.isFinite(tourDayMin) || dNum < tourDayMin)) {
+        if (lastHeadDay[hr.id] === void 0 || dNum > lastHeadDay[hr.id]) lastHeadDay[hr.id] = dNum;
+      }
+      if (prevCompRound && getFixtureTourKey(fxItem) === prevCompRound) prevTourHeadIds.add(hr.id);
+    }
+    if (fxItem.varReferee && varLoad[fxItem.varReferee] !== void 0) varLoad[fxItem.varReferee]++;
+    if (fxItem.avarReferee && varLoad[fxItem.avarReferee] !== void 0) varLoad[fxItem.avarReferee]++;
+    if (fxItem.reserveReferee && resLoad[fxItem.reserveReferee] !== void 0) resLoad[fxItem.reserveReferee]++;
   }
   const comp = validMatches[0].comp;
   let eligible = db.referees.filter((r) => !r.leagues || r.leagues.includes(comp));
@@ -5844,6 +5917,8 @@ function assignTourReferees(tourList, force = false) {
     if (force) delete f.manualReferees;
     let pool2 = eligible.filter((r) => !usedHeadIds.has(r.id));
     if (!pool2.length) pool2 = eligible;
+    const headSpecialists = pool2.filter((r) => r.role !== "\u0420\u0435\u0437\u0435\u0440\u0432\u043D\u044B\u0439 \u0441\u0443\u0434\u044C\u044F");
+    if (headSpecialists.length) pool2 = headSpecialists;
     const homeCity = (team(f.home)?.city || "").trim().toLowerCase();
     const awayCity = (team(f.away)?.city || "").trim().toLowerCase();
     const nonSameCity = pool2.filter((r) => {
@@ -5852,36 +5927,88 @@ function assignTourReferees(tourList, force = false) {
       return rc !== homeCity && rc !== awayCity;
     });
     const candidatePool = nonSameCity.length ? nonSameCity : pool2;
-    const sorted = [...candidatePool].sort((a, b) => (b.rating || 0) - (a.rating || 0));
-    const chosen = sorted[0];
+    const tierInfo = classifyMatchTier(f);
+    const minLoad = Math.min(...candidatePool.map((r) => headLoad[r.id] || 0));
+    const fDay = parseDayNum(f.date);
+    const restedPool = candidatePool.filter((r) => {
+      if (prevTourHeadIds.has(r.id)) return false;
+      const ld = lastHeadDay[r.id];
+      if (Number.isFinite(fDay) && Number.isFinite(ld) && fDay - ld >= 0 && fDay - ld <= 4) return false;
+      return true;
+    });
+    const activePool = restedPool.some((r) => (headLoad[r.id] || 0) <= minLoad + 1) ? restedPool : candidatePool;
+    const minActiveLoad = Math.min(...activePool.map((r) => headLoad[r.id] || 0));
+    const loadBand = tierInfo.tier === "top" ? minActiveLoad + 1 : minActiveLoad;
+    let tierPool = activePool.filter((r) => (headLoad[r.id] || 0) <= loadBand);
+    if (!tierPool.length) tierPool = activePool;
+    const scored = tierPool.map((r) => {
+      const ld = headLoad[r.id] || 0;
+      const eff = getRefereeEffectiveSkill(r);
+      const excessLoad = ld - minActiveLoad;
+      let sc = -excessLoad * 1.15;
+      if (tierInfo.tier === "top") {
+        sc += (eff - 7.3) * 0.9 + Math.random() * 0.25;
+      } else if (tierInfo.tier === "weak") {
+        sc += (7.6 - eff) * 0.25 + Math.random() * 0.35;
+      } else {
+        sc += Math.random() * 0.45;
+      }
+      return { r, sc };
+    }).sort((a, b) => b.sc - a.sc);
+    const chosen = scored[0]?.r;
     if (chosen) {
       f.refereeId = chosen.id;
       f.refereeName = chosen.name;
       usedHeadIds.add(chosen.id);
+      headLoad[chosen.id] = (headLoad[chosen.id] || 0) + 1;
+      if (Number.isFinite(fDay)) lastHeadDay[chosen.id] = fDay;
     }
   }
   const allHeadNames = new Set(validMatches.map((f) => f.refereeName).filter(Boolean));
   const nonHeadRefs = db.referees.filter((r) => !usedHeadIds.has(r.id) && !allHeadNames.has(r.name));
   const nonHeadPool = nonHeadRefs.length ? nonHeadRefs : db.referees.filter((r) => !usedHeadIds.has(r.id));
   const asstPool = (db.assistants || []).length ? db.assistants : ASSISTANT_REFEREES.map((n, i) => ({ id: "asst_" + i, name: n }));
-  const shuffledAssts = [...asstPool].sort(() => Math.random() - 0.5);
-  let asstIdx = 0;
+  const asstLoad = {};
+  for (const fxItem of db.fixtures || []) {
+    if ((fxItem.season || S()) !== curSeason || unlockedIds.has(fxItem.id)) continue;
+    if (Array.isArray(fxItem.assistants)) {
+      for (const an of fxItem.assistants) asstLoad[an] = (asstLoad[an] || 0) + 1;
+    }
+  }
+  const pickLeastLoaded = (arr, loadMap) => {
+    if (!arr.length) return null;
+    const minL = Math.min(...arr.map((x) => loadMap[x.name] || 0));
+    const least = arr.filter((x) => (loadMap[x.name] || 0) <= minL);
+    const chosen = least[Math.floor(Math.random() * least.length)] || arr[0];
+    if (chosen) loadMap[chosen.name] = (loadMap[chosen.name] || 0) + 1;
+    return chosen;
+  };
+  const usedTourAssts = /* @__PURE__ */ new Set();
   for (const f of validMatches) {
     if (isLocked(f)) continue;
-    const a1 = shuffledAssts[asstIdx % shuffledAssts.length]?.name || "\u0414\u043C\u0438\u0442\u0440\u0438\u0439 \u041C\u043E\u0441\u044F\u043A\u0438\u043D";
-    const a2 = shuffledAssts[(asstIdx + 1) % shuffledAssts.length]?.name || "\u0415\u0433\u043E\u0440 \u0411\u043E\u043B\u0445\u043E\u0432\u0438\u0442\u0438\u043D";
-    asstIdx += 2;
-    f.assistants = [a1, a2];
+    let availAssts = asstPool.filter((a) => !usedTourAssts.has(a.name));
+    if (availAssts.length < 2) availAssts = asstPool;
+    const a1Obj = pickLeastLoaded(availAssts, asstLoad);
+    if (a1Obj) usedTourAssts.add(a1Obj.name);
+    let availAssts2 = asstPool.filter((a) => a.name !== a1Obj?.name && !usedTourAssts.has(a.name));
+    if (!availAssts2.length) availAssts2 = asstPool.filter((a) => a.name !== a1Obj?.name);
+    const a2Obj = pickLeastLoaded(availAssts2, asstLoad);
+    if (a2Obj) usedTourAssts.add(a2Obj.name);
+    f.assistants = [
+      a1Obj?.name || "\u0414\u043C\u0438\u0442\u0440\u0438\u0439 \u041C\u043E\u0441\u044F\u043A\u0438\u043D",
+      a2Obj?.name || "\u0415\u0433\u043E\u0440 \u0411\u043E\u043B\u0445\u043E\u0432\u0438\u0442\u0438\u043D"
+    ];
     const resList = nonHeadPool.filter((r) => r.id !== f.refereeId);
-    const chosenRes = resList.find((r) => r.role === "\u0420\u0435\u0437\u0435\u0440\u0432\u043D\u044B\u0439 \u0441\u0443\u0434\u044C\u044F") || resList[Math.floor(Math.random() * resList.length)];
+    const resSpecialists = resList.filter((r) => r.role === "\u0420\u0435\u0437\u0435\u0440\u0432\u043D\u044B\u0439 \u0441\u0443\u0434\u044C\u044F");
+    const chosenRes = (resSpecialists.length && Math.random() < 0.45 ? pickLeastLoaded(resSpecialists, resLoad) : pickLeastLoaded(resList, resLoad));
     f.reserveReferee = chosenRes?.name || "\u0412\u0435\u0440\u0430 \u041E\u043F\u0435\u0439\u043A\u0438\u043D\u0430";
     let varList = nonHeadPool.filter((r) => r.varRole && r.id !== f.refereeId && r.name !== f.reserveReferee);
     if (!varList.length) varList = nonHeadPool.filter((r) => r.name !== f.reserveReferee);
-    const chosenVar = varList[Math.floor(Math.random() * varList.length)];
+    const chosenVar = pickLeastLoaded(varList, varLoad);
     f.varReferee = chosenVar?.name || "\u0421\u0435\u0440\u0433\u0435\u0439 \u041A\u0430\u0440\u0430\u0441\u0435\u0432";
     let avarList = nonHeadPool.filter((r) => r.id !== f.refereeId && r.name !== f.reserveReferee && r.name !== f.varReferee);
     if (!avarList.length) avarList = nonHeadPool;
-    const chosenAvar = avarList[Math.floor(Math.random() * avarList.length)];
+    const chosenAvar = pickLeastLoaded(avarList, varLoad);
     f.avarReferee = chosenAvar?.name || "\u041F\u0430\u0432\u0435\u043B \u041A\u0443\u043A\u0443\u044F\u043D";
   }
 }
@@ -5901,75 +6028,268 @@ function assignReferee(f, siblingList) {
   const siblings = validSiblings.filter((x) => x.id !== f.id && getFixtureTourKey(x) === tourKey);
   assignTourReferees([f, ...siblings]);
 }
-function computeRefereeMatchEval(f, events = []) {
-  const yc = events.length ? events.filter((e) => e.type === "yellow").length : ((f.st?.home?.yc || 0) + (f.st?.away?.yc || 0));
-  const rc = events.length ? events.filter((e) => e.type === "red").length : ((f.st?.home?.rc || 0) + (f.st?.away?.rc || 0));
-  const pen = events.length ? events.filter((e) => e.type === "pen_goal" || e.type === "pen_miss" || e.type === "penalty").length : ((f.st?.home?.penF || 0) + (f.st?.away?.penF || 0));
-  const fouls = events.length ? events.filter((e) => e.type === "foul").length : ((f.st?.home?.fo || 0) + (f.st?.away?.fo || 0));
-  const refErr = events.length ? events.filter((e) => e.type === "ref_error").length : ((f.st?.home?.refF || 0) + (f.st?.away?.refF || 0));
-  const varChecks = events.length ? events.filter((e) => e.type === "var").length : 0;
-  const tierInfo = classifyMatchTier(f);
-  const disciplineDelta = yc <= 4 && rc === 0 ? 0.1 : rc > 0 ? -0.1 : 0.05;
-  const errorDelta = refErr > 0 ? +(-0.15 * refErr).toFixed(2) : 0;
-  const topBonus = tierInfo.tier === "top" && rc === 0 && refErr === 0 ? 0.05 : 0;
-  return { yc, rc, pen, fouls, refErr, varChecks, tierInfo, disciplineDelta, errorDelta, topBonus };
+function getFixtureEskCases(f) {
+  if (!f || !Array.isArray(db?.eskCases)) return [];
+  const hName = tn(f.home);
+  const aName = tn(f.away);
+  return db.eskCases.filter((c) => {
+    if (c.fixtureId && c.fixtureId === f.id) return true;
+    if (c.matchId && c.matchId === f.id) return true;
+    if (c.homeTeam && c.awayTeam && c.homeTeam === hName && c.awayTeam === aName && (!f.date || !c.date || c.date === f.date)) return true;
+    return false;
+  });
 }
-function updateRefereeStats(f, events = []) {
-  if (!f?.refereeId || !db?.referees) return;
-  const r = db.referees.find((x) => x.id === f.refereeId);
-  if (!r) return;
-  const ev = computeRefereeMatchEval(f, events);
-  r.matches = (r.matches || 0) + 1;
-  r.yellows = (r.yellows || 0) + ev.yc;
-  r.reds = (r.reds || 0) + ev.rc;
-  r.penalties = (r.penalties || 0) + ev.pen;
-  const base = r.rating > 0 ? Number(r.rating) : 7.5;
-  const rawNext = base + ev.disciplineDelta + ev.errorDelta + ev.topBonus;
-  const nextRating = Math.min(9.9, Math.max(5.5, +rawNext.toFixed(2)));
-  const delta = +(nextRating - base).toFixed(2);
-  r.rating = nextRating;
-  if (!Array.isArray(r.ratingHistory)) r.ratingHistory = [];
-  const histEntry = {
-    fid: f.id,
-    season: f.season || S(),
-    date: f.date || "",
-    label: f.label || `${(f.comp || "").toUpperCase()} тур ${f.round || ""}`,
-    comp: f.comp,
-    home: f.home,
-    away: f.away,
-    homeName: tn(f.home),
-    awayName: tn(f.away),
-    hg: f.hg,
-    ag: f.ag,
-    tier: ev.tierInfo.tier,
-    tierLabel: ev.tierInfo.label,
-    tierReason: ev.tierInfo.reason,
-    yc: ev.yc,
-    rc: ev.rc,
-    pen: ev.pen,
-    fouls: ev.fouls,
-    refErr: ev.refErr,
-    varChecks: ev.varChecks,
-    baseBefore: +base.toFixed(2),
-    disciplineDelta: ev.disciplineDelta,
-    errorDelta: ev.errorDelta,
-    topBonus: ev.topBonus,
-    delta,
-    ratingAfter: nextRating,
-    at: Date.now()
+function computeRefereeMatchEval(f, events = [], matchObj: any = null, storedHist: any = null) {
+  const yc = events.length ? events.filter((e) => e.type === "yellow").length : ((f.st?.teams?.home?.yc ?? f.st?.home?.yc ?? 0) + (f.st?.teams?.away?.yc ?? f.st?.away?.yc ?? 0));
+  const rc = events.length ? events.filter((e) => e.type === "red").length : ((f.st?.teams?.home?.rc ?? f.st?.home?.rc ?? 0) + (f.st?.teams?.away?.rc ?? f.st?.away?.rc ?? 0));
+  const pen = events.length ? events.filter((e) => e.type === "pen_goal" || e.type === "pen_miss" || e.type === "penalty").length : ((f.st?.teams?.home?.penF ?? f.st?.home?.penF ?? 0) + (f.st?.teams?.away?.penF ?? f.st?.away?.penF ?? 0));
+  const fouls = events.length ? events.filter((e) => e.type === "foul").length : ((f.st?.teams?.home?.fo ?? f.st?.home?.fo ?? 0) + (f.st?.teams?.away?.fo ?? f.st?.away?.fo ?? 0));
+  const refErr = events.length ? events.filter((e) => e.type === "ref_error").length : ((f.st?.teams?.home?.refF ?? f.st?.home?.refF ?? 0) + (f.st?.teams?.away?.refF ?? f.st?.away?.refF ?? 0));
+  const varEvents = events.length ? events.filter((e) => e.type === "var") : [];
+  const varChecks = varEvents.length;
+  const varOverturns = events.length
+    ? events.filter((e) => {
+        const txt = String(e.text || "");
+        if (e.disallowedGoal) return true;
+        if (e.type === "var" && /(?:отмен|изменил|пересмотр|не\s+засчитан|снял\s+красн|вместо\s+ж[её]лт)/i.test(txt) && !/подтвердил|засчитан|в силе/i.test(txt)) return true;
+        return false;
+      }).length
+    : 0;
+  const tierInfo = classifyMatchTier(f);
+  const baseGrade = tierInfo.tier === "top" ? 8.05 : tierInfo.tier === "weak" ? 7.8 : 7.9;
+  const eskCases = getFixtureEskCases(f);
+  const eskIncorrect = eskCases.filter((c) => c.status === "resolved" && (c.verdict === "incorrect" || c.hearing?.verdict === "error_confirmed")).length;
+  const eskDisputable = eskCases.filter((c) => c.status === "resolved" && c.verdict === "disputable").length;
+  const eskCorrect = eskCases.filter((c) => c.status === "resolved" && c.verdict === "correct").length;
+
+  let controlDelta = 0;
+  if (yc >= 9 || fouls >= 42) controlDelta = -0.25;
+  else if (yc >= 7 || fouls >= 35) controlDelta = -0.15;
+  else if (yc <= 4 && fouls <= 26) controlDelta = 0.15;
+  else controlDelta = 0.05;
+
+  let varDelta = 0;
+  if (varOverturns > 0) {
+    varDelta = -Math.min(0.6, +(varOverturns * 0.25).toFixed(2));
+  } else if (varChecks > 0 && refErr === 0 && eskIncorrect === 0) {
+    varDelta = 0.05;
+  }
+
+  let keyDecisionBonus = 0;
+  if ((rc > 0 || pen > 0) && refErr === 0 && varOverturns === 0 && eskIncorrect === 0) {
+    keyDecisionBonus += 0.15;
+  }
+  if (eskCorrect > 0 && refErr === 0 && eskIncorrect === 0) {
+    keyDecisionBonus += 0.1;
+  }
+  keyDecisionBonus = +Math.min(0.25, keyDecisionBonus).toFixed(2);
+
+  let errorDelta = 0;
+  if (refErr > 0) errorDelta -= refErr * 0.85;
+  if (eskIncorrect > 0) {
+    errorDelta -= refErr > 0 ? eskIncorrect * 0.45 : eskIncorrect * 0.85;
+  }
+  if (eskDisputable > 0 && eskIncorrect === 0) {
+    errorDelta -= eskDisputable * 0.2;
+  }
+  errorDelta = +Math.max(-2.5, errorDelta).toFixed(2);
+
+  const objMatchRating = +clamp(baseGrade + controlDelta + keyDecisionBonus + varDelta + errorDelta, 5.0, 9.5).toFixed(2);
+
+  const rawAiEval = matchObj?.refereeReport || storedHist?.aiEval || null;
+  let aiEval: { rating: number; summary: string } | null = null;
+  if (rawAiEval && typeof rawAiEval === "object") {
+    const aiR = Number(rawAiEval.rating);
+    if (Number.isFinite(aiR) && aiR >= 4 && aiR <= 10) {
+      aiEval = {
+        rating: +clamp(aiR, 5.0, 9.5).toFixed(2),
+        summary: String(rawAiEval.summary || rawAiEval.reason || "").trim().slice(0, 260)
+      };
+    }
+  }
+
+  let matchRating = objMatchRating;
+  let aiAdjustment = 0;
+  if (aiEval) {
+    let blended = aiEval.rating * 0.55 + objMatchRating * 0.45;
+    if (refErr > 0 || eskIncorrect > 0) blended = Math.min(blended, 6.85);
+    matchRating = +clamp(blended, 5.0, 9.5).toFixed(2);
+    aiAdjustment = +(matchRating - objMatchRating).toFixed(2);
+  }
+
+  return {
+    yc, rc, pen, fouls, refErr, varChecks, varOverturns,
+    eskIncorrect, eskDisputable, eskCorrect,
+    tierInfo, baseGrade, controlDelta, keyDecisionBonus, varDelta, errorDelta,
+    objMatchRating, aiEval, aiAdjustment, matchRating,
+    disciplineDelta: controlDelta,
+    topBonus: keyDecisionBonus
   };
-  const idx = r.ratingHistory.findIndex((x) => x.fid === f.id);
-  if (idx >= 0) r.ratingHistory[idx] = histEntry;
-  else r.ratingHistory.push(histEntry);
-  if (Array.isArray(f.assistants) && db.assistants) {
-    for (const aname of f.assistants) {
-      const a = db.assistants.find((x) => x.name === aname);
-      if (a) {
-        a.matches = (a.matches || 0) + 1;
-        a.rating = a.rating > 0 ? Math.min(9.9, +(a.rating + 0.05).toFixed(1)) : 7.5;
+}
+function reconcileRefereeStats() {
+  if (!db?.referees) return;
+  const refs = db.referees;
+  const refById = new Map<string, any>();
+  const refByName = new Map<string, any>();
+  const oldHistByRefFid = new Map<string, Map<string, any>>();
+  for (const r of refs) {
+    refById.set(r.id, r);
+    if (r.name) refByName.set(String(r.name).trim().toLowerCase(), r);
+    const hMap = new Map<string, any>();
+    for (const h of Array.isArray(r.ratingHistory) ? r.ratingHistory : []) {
+      if (h?.fid) hMap.set(h.fid, h);
+    }
+    oldHistByRefFid.set(r.id, hMap);
+    r.matches = 0;
+    r.varMatches = 0;
+    r.varOnlyMatches = 0;
+    r.avarMatches = 0;
+    r.reserveMatches = 0;
+    r.totalMatches = 0;
+    r.yellows = 0;
+    r.reds = 0;
+    r.penalties = 0;
+    r.ratingHistory = [];
+  }
+  const asstAcc = new Map<string, { matches: number; sumRating: number }>();
+  for (const a of db.assistants || []) {
+    asstAcc.set(a.id, { matches: 0, sumRating: 0 });
+  }
+  const doneFixtures = [...db.fixtures || []]
+    .filter((f) => f && f.status === "done")
+    .sort((a, b) => String(a.date || "").localeCompare(String(b.date || "")) || (Number(a.round || 0) - Number(b.round || 0)));
+
+  for (const f of doneFixtures) {
+    let headRef = f.refereeId ? refById.get(f.refereeId) : null;
+    if (!headRef && f.refereeName) {
+      headRef = refByName.get(String(f.refereeName).trim().toLowerCase()) || null;
+      if (headRef && !f.refereeId) f.refereeId = headRef.id;
+    }
+    const mObj = getMatch(f.id);
+    const evs = Array.isArray(mObj?.events) ? mObj.events : [];
+    const evalRes = headRef ? computeRefereeMatchEval(f, evs, mObj, oldHistByRefFid.get(headRef.id)?.get(f.id)) : null;
+
+    if (headRef && evalRes) {
+      headRef.matches++;
+      headRef.totalMatches++;
+      headRef.yellows += evalRes.yc;
+      headRef.reds += evalRes.rc;
+      headRef.penalties += evalRes.pen;
+      const entry: any = {
+        fid: f.id,
+        season: f.season || S(),
+        date: f.date || "",
+        label: f.label || `${(f.comp || "").toUpperCase()} тур ${f.round || ""}`,
+        comp: f.comp,
+        home: f.home,
+        away: f.away,
+        homeName: tn(f.home),
+        awayName: tn(f.away),
+        hg: f.hg,
+        ag: f.ag,
+        tier: evalRes.tierInfo.tier,
+        tierLabel: evalRes.tierInfo.label,
+        tierReason: evalRes.tierInfo.reason,
+        yc: evalRes.yc,
+        rc: evalRes.rc,
+        pen: evalRes.pen,
+        fouls: evalRes.fouls,
+        refErr: evalRes.refErr,
+        varChecks: evalRes.varChecks,
+        varOverturns: evalRes.varOverturns,
+        eskIncorrect: evalRes.eskIncorrect,
+        eskDisputable: evalRes.eskDisputable,
+        eskCorrect: evalRes.eskCorrect,
+        baseGrade: evalRes.baseGrade,
+        controlDelta: evalRes.controlDelta,
+        keyDecisionBonus: evalRes.keyDecisionBonus,
+        varDelta: evalRes.varDelta,
+        errorDelta: evalRes.errorDelta,
+        objMatchRating: evalRes.objMatchRating,
+        aiEval: evalRes.aiEval,
+        aiAdjustment: evalRes.aiAdjustment,
+        matchRating: evalRes.matchRating,
+        disciplineDelta: evalRes.controlDelta,
+        topBonus: evalRes.keyDecisionBonus,
+        at: Date.now()
+      };
+      headRef.ratingHistory.push(entry);
+    }
+
+    if (f.varReferee) {
+      const vr = refByName.get(String(f.varReferee).trim().toLowerCase());
+      if (vr && vr.id !== headRef?.id) {
+        vr.varOnlyMatches++;
+        vr.varMatches++;
+        vr.totalMatches++;
+      }
+    }
+    if (f.avarReferee) {
+      const avr = refByName.get(String(f.avarReferee).trim().toLowerCase());
+      if (avr && avr.id !== headRef?.id && avr.name !== f.varReferee) {
+        avr.avarMatches++;
+        avr.varMatches++;
+        avr.totalMatches++;
+      }
+    }
+    if (f.reserveReferee) {
+      const rr = refByName.get(String(f.reserveReferee).trim().toLowerCase());
+      if (rr && rr.id !== headRef?.id) {
+        rr.reserveMatches++;
+        rr.totalMatches++;
+      }
+    }
+
+    if (Array.isArray(f.assistants) && Array.isArray(db.assistants)) {
+      const hasVarOffsideOverturn = evs.some((e: any) => e.type === "offside" && e.disallowedGoal);
+      const asstMatchGrade = hasVarOffsideOverturn ? 7.65 : 7.95;
+      for (const aname of f.assistants) {
+        const a = db.assistants.find((x: any) => x.name === aname);
+        if (a) {
+          const acc = asstAcc.get(a.id) || { matches: 0, sumRating: 0 };
+          acc.matches++;
+          acc.sumRating += asstMatchGrade;
+          asstAcc.set(a.id, acc);
+        }
       }
     }
   }
+
+  for (const r of refs) {
+    if (r.matches > 0) {
+      const sum = r.ratingHistory.reduce((s: number, h: any) => s + Number(h.matchRating || 0), 0);
+      r.rating = +(sum / r.matches).toFixed(2);
+      delete r.manualRating;
+    } else if (!r.manualRating) {
+      r.rating = 0;
+    }
+  }
+  for (const a of db.assistants || []) {
+    const acc = asstAcc.get(a.id);
+    if (acc && acc.matches > 0) {
+      a.matches = acc.matches;
+      a.rating = +(acc.sumRating / acc.matches).toFixed(2);
+      delete a.manualRating;
+    } else {
+      a.matches = 0;
+      if (!a.manualRating) a.rating = 0;
+    }
+  }
+}
+function updateRefereeStats(f, events = [], matchObj: any = null) {
+  if (!db?.referees) return;
+  const r = db.referees.find((x) => (f?.refereeId && x.id === f.refereeId) || (f?.refereeName && x.name === f.refereeName));
+  if (r && matchObj?.refereeReport) {
+    if (!Array.isArray(r.ratingHistory)) r.ratingHistory = [];
+    const existing = r.ratingHistory.find((x: any) => x.fid === f.id);
+    const aiR = Number(matchObj.refereeReport.rating);
+    if (Number.isFinite(aiR)) {
+      const aiEval = { rating: +clamp(aiR, 5.0, 9.5).toFixed(2), summary: String(matchObj.refereeReport.summary || "").trim().slice(0, 260) };
+      if (existing) existing.aiEval = aiEval;
+      else r.ratingHistory.push({ fid: f.id, aiEval });
+    }
+  }
+  reconcileRefereeStats();
 }
 function assignFixtureWeather(f) {
   if (!f) return f;
@@ -6096,7 +6416,8 @@ function load() {
       delete f.avarReferee;
     }
   }
-  const tours = {};
+  reconcileRefereeStats();
+  const tours: Record<string, any[]> = {};
   for (const f of db.fixtures) {
     if (f.comp === "rpl" || f.comp === "cup") {
       const k = getFixtureTourKey(f);
@@ -6104,8 +6425,17 @@ function load() {
       tours[k].push(f);
     }
   }
-  for (const list of Object.values(tours)) {
-    assignTourReferees(list, false);
+  const sortedTourLists = Object.values(tours).sort((a, b) => {
+    const ad = String(a[0]?.date || "9999-99-99");
+    const bd = String(b[0]?.date || "9999-99-99");
+    return ad.localeCompare(bd) || (Number(a[0]?.round || 0) - Number(b[0]?.round || 0));
+  });
+  const schedRplCup = db.fixtures.filter((f) => (f.season || S()) === S() && (f.comp === "rpl" || f.comp === "cup") && f.status === "scheduled" && !f.manualReferees);
+  const distinctScheduledHeads = new Set(schedRplCup.map((f) => f.refereeId).filter(Boolean));
+  const headCapableCount = (db.referees || []).filter((r) => r.role !== "\u0420\u0435\u0437\u0435\u0440\u0432\u043D\u044B\u0439 \u0441\u0443\u0434\u044C\u044F").length;
+  const needsRotationRebalance = schedRplCup.length >= 16 && headCapableCount >= 18 && distinctScheduledHeads.size > 0 && distinctScheduledHeads.size <= 10;
+  for (const list of sortedTourLists) {
+    assignTourReferees(list, needsRotationRebalance);
   }
   save();
   db.comps = COMPS;
@@ -6226,6 +6556,7 @@ function saveNow(immediatePg = false) {
       pgQueueState(() => db, immediatePg);
       return;
     }
+    if (process.env.NODE_ENV === "test") return;
     fs3.writeFileSync(DB_FILE + ".tmp", JSON.stringify(db));
     fs3.renameSync(DB_FILE + ".tmp", DB_FILE);
   } catch (e) {
@@ -6251,6 +6582,7 @@ var putMatch = (id, m) => {
     pgQueueMatch(id, () => m);
     return;
   }
+  if (process.env.NODE_ENV === "test") return;
   fs3.writeFileSync(path3.join(MDIR, id + ".json"), JSON.stringify(m));
 };
 var putMatchNow = async (id, m) => {
@@ -6259,6 +6591,7 @@ var putMatchNow = async (id, m) => {
     await pgWriteMatchNow(id, m);
     return;
   }
+  if (process.env.NODE_ENV === "test") return;
   fs3.writeFileSync(path3.join(MDIR, id + ".json"), JSON.stringify(m));
 };
 var S = () => db.settings.season;
@@ -8681,19 +9014,88 @@ function staffSummary(tid) {
   if (!staff.length) return "\u043D\u0435\u0442 \u0434\u0430\u043D\u043D\u044B\u0445 \u043E \u0440\u0430\u0441\u0448\u0438\u0440\u0435\u043D\u043D\u043E\u043C \u0448\u0442\u0430\u0431\u0435";
   return staff.slice(0, 4).map((s) => `${s.roleTitle || s.role}: ${s.name}`).join("; ");
 }
+function estimateHistoricalEnergySpent(ps: any, p: any, fxObj: any) {
+  const mins = Math.max(0, Math.round(ps?.min || 0));
+  if (mins <= 0) return { spent: 0, reason: "не выходил на поле", source: "events" };
+  const pos = String(p?.pos || "").trim();
+  const minFrac = clamp(mins / 90, 0.08, 1.25);
+  if (pos === "ВР") {
+    const sv = Number(ps?.sv || 0);
+    const spent = clamp(Math.round((4.5 + sv * 0.65) * Math.min(1.1, Math.max(0.25, minFrac))), 2, 15);
+    return { spent, reason: sv >= 5 ? `работа в воротах (${sv} сейвов)` : "штатная игра в воротах", source: "events" };
+  }
+  const baseByPos = pos === "ЦЗ" ? 15.5 : pos === "ЛЗ" || pos === "ПЗ" || pos === "ОП" ? 19.5 : pos === "ЦП" || pos === "АП" ? 20.5 : 19;
+  const actLoad = (Number(ps?.tk || 0) * 0.65) + (Number(ps?.sh || 0) * 0.6) + (Number(ps?.ff || 0) * 0.5) + (Number(ps?.g || 0) + Number(ps?.a || 0)) * 0.4;
+  const spent = clamp(Math.round((baseByPos + actLoad) * minFrac), 3, 46);
+  const reason = spent >= 30 ? "высокая игровая нагрузка" : spent <= 16 ? "экономный объём без лишних рывков" : "рабочий объём на поле";
+  return { spent, reason, source: "events" };
+}
 function computePlayerFatigue(tid: string, f: any) {
   const matchDate = f?.date || "";
   const allPlayed = (db.fixtures || [])
     .filter((x) => x.status === "done" && x.id !== f?.id && x.date && x.date < matchDate)
     .sort((a, b) => (b.date + (b.time || "")).localeCompare(a.date + (a.time || "")));
+  const recent21Asc = allPlayed
+    .filter((x) => daysBetween(x.date, matchDate) <= 21)
+    .slice()
+    .reverse();
   const recent14 = allPlayed.filter((x) => daysBetween(x.date, matchDate) <= 14);
   const teamRecent = allPlayed.filter((x) => x.home === tid || x.away === tid).slice(0, 6);
   const teamRecent14Count = recent14.filter((x) => x.home === tid || x.away === tid).length;
 
+  const staff = typeof getStaffForTeam === "function" ? getStaffForTeam(tid) : [];
+  const hasFit = staff.some((s: any) => s.role === "fitness");
+  const hasDoc = staff.some((s: any) => s.role === "doctor");
+  const staffRecBonus = (hasFit ? 0.8 : 0) + (hasDoc ? 0.7 : 0);
+
   const forPlayer = (pid: string) => {
+    const pObj = player(pid);
+    const pos = String(pObj?.pos || "").trim();
+    const isGk = pos === "ВР";
+    const pAge = pObj?.born ? age(pObj.born) : 25;
+    const ageRecMod = isGk ? 0 : pAge <= 23 ? 1.0 : pAge >= 34 ? -1.5 : pAge >= 31 ? -0.7 : 0;
+    const recoveryPerDay = isGk ? 24 : clamp(10.0 + ageRecMod + staffRecBonus, 7.5, 13.5);
+
+    let energy = 100;
+    let prevDate: string | null = null;
+    let lastSpent = 0;
+    let lastReason = "";
+    let lastSource = "";
+
     let min14d = 0, min10d = 0, apps14d = 0, apps10d = 0, full10d = 0, full14d = 0, starts14d = 0, subApps14d = 0;
     let lastMatchDaysAgo: number | null = null;
     let lastMatchMin = 0;
+
+    for (const x of recent21Asc) {
+      const ps = x.st?.players?.[pid];
+      if (!ps || !(ps.min > 0)) continue;
+      if (prevDate !== null) {
+        const gap = Math.max(0, daysBetween(prevDate, x.date));
+        energy = Math.min(100, energy + gap * recoveryPerDay);
+      }
+      prevDate = x.date;
+      let spent = Number(ps.energySpent);
+      let reason = typeof ps.energyReason === "string" ? ps.energyReason : "";
+      let source = typeof ps.energySource === "string" ? ps.energySource : "";
+      if (!Number.isFinite(spent)) {
+        const est = estimateHistoricalEnergySpent(ps, pObj, x);
+        spent = est.spent;
+        reason = est.reason;
+        source = est.source;
+      }
+      if (isGk) spent = clamp(spent, 2, 18);
+      else spent = clamp(spent, 1, 58);
+
+      energy = Math.max(5, Math.min(100, energy - spent));
+      lastSpent = Math.round(spent);
+      lastReason = reason;
+      lastSource = source;
+    }
+    if (prevDate !== null) {
+      const gapToMatch = Math.max(0, daysBetween(prevDate, matchDate));
+      energy = Math.min(100, energy + gapToMatch * recoveryPerDay);
+    }
+
     for (const x of recent14) {
       const ps = x.st?.players?.[pid];
       if (!ps || !(ps.min > 0)) continue;
@@ -8726,61 +9128,53 @@ function computePlayerFatigue(tid: string, f: any) {
       if (started) consecutiveStarts++;
       else break;
     }
-    let level = "neutral";
-    let label = "";
-    if (full10d >= 3 || (min10d >= 240 && apps10d >= 3)) {
-      level = "exhausted";
-      label = `накопленная усталость (${apps10d}-й ${full10d >= 3 ? "полный " : ""}матч за 10 дней, ${min10d} мин${consecutiveStarts >= 3 ? `, ${consecutiveStarts} игр подряд в старте` : ""}) — после 65-й минуты заметно проседает`;
-    } else if (min14d >= 240 || (consecutiveStarts >= 3 && min14d >= 180)) {
-      level = "tired";
-      label = `высокая нагрузка (${apps14d} игр, ${min14d} мин за 14 дней${consecutiveStarts >= 3 ? `, ${consecutiveStarts} подряд в старте` : ""}) — во 2-м тайме возможен спад`;
-    } else if (lastMatchDaysAgo !== null && lastMatchDaysAgo <= 3 && lastMatchMin >= 70) {
-      level = "tired";
-      label = `неполное восстановление (${lastMatchMin} мин всего ${lastMatchDaysAgo} дн. назад, ${min14d} мин за 14 дн.)`;
-    } else if (apps14d > 0 && starts14d === 0) {
-      level = "fresh";
-      label = `свежий, выходил только на замену (${min14d} мин за ${apps14d} игр за 14 дн.)`;
-    } else if (apps14d === 0 && teamRecent14Count > 0) {
-      level = "fresh";
-      label = `свежий, не играл в последних ${teamRecent14Count} матчах команды`;
-    } else if (apps14d > 0) {
-      level = "moderate";
-      label = `в игровом тонусе (${min14d} мин за 14 дн., без перегруза)`;
-    } else {
-      level = "fresh";
-      label = "свежий (начало игрового отрезка)";
-    }
-    let penalty = 0;
-    if (lastMatchDaysAgo !== null && lastMatchDaysAgo <= 4 && lastMatchMin > 0) {
-      const recWeight = lastMatchDaysAgo <= 1 ? 28 : lastMatchDaysAgo === 2 ? 21 : lastMatchDaysAgo === 3 ? 14 : 7;
-      penalty += Math.round((Math.min(120, lastMatchMin) / 90) * recWeight);
-    }
-    penalty += Math.round(Math.max(0, min10d - 90) * 0.14);
-    penalty += Math.round(Math.max(0, min14d - 180) * 0.07);
-    if (consecutiveStarts >= 3) penalty += (consecutiveStarts - 2) * 5;
 
-    let readiness = 100;
+    let readiness = Math.round(clamp(energy, 5, 100));
+    if (isGk) readiness = Math.max(85, readiness);
+
+    let level = "fresh";
     let shortText = "Готов";
     let statusCode = "ready";
-    if (level === "exhausted") {
-      readiness = Math.max(25, Math.min(48, 72 - penalty));
+    let label = "";
+
+    if (isGk) {
+      level = readiness >= 85 ? "fresh" : "moderate";
+      shortText = level === "fresh" ? "Готов" : "В тонусе";
+      statusCode = "ready";
+      label = lastSpent
+        ? `вратарь, низкий расход сил в воротах (готовность ${readiness}%; прошл. матч −${lastSpent}%${lastReason ? ` — ${lastReason}` : ""})`
+        : `вратарь, полностью готов к матчу (${readiness}%)`;
+    } else if (readiness < 50) {
+      level = "exhausted";
       shortText = "Истощён";
       statusCode = "rest";
-    } else if (level === "tired") {
-      readiness = Math.max(52, Math.min(73, 88 - penalty));
+      label = `сильная усталость (энергия ${readiness}%${lastSpent ? `; прошл. игра ${lastMatchDaysAgo ?? "?"} дн. назад −${lastSpent}%` : ""}${lastReason ? ` — ${lastReason}` : ""}) — во 2-м тайме риск спада и травмы`;
+    } else if (readiness < 75) {
+      level = "tired";
       shortText = "Устал";
       statusCode = "caution";
-    } else if (level === "moderate") {
-      readiness = Math.max(76, Math.min(89, 96 - penalty));
+      label = `неполное восстановление (энергия ${readiness}%${lastSpent ? `; прошл. игра ${lastMatchDaysAgo ?? "?"} дн. назад −${lastSpent}%` : ""}${lastReason ? ` — ${lastReason}` : ""}) — возможен спад после 65-й минуты`;
+    } else if (readiness < 90) {
+      level = "moderate";
       shortText = "В тонусе";
       statusCode = "ready";
+      label = `в игровом тонусе (энергия ${readiness}%${lastSpent ? `; прошл. игра −${lastSpent}%` : ""}${lastReason ? ` — ${lastReason}` : ""})`;
     } else {
-      readiness = apps14d === 0 ? 100 : Math.max(90, Math.min(98, 100 - Math.round(min14d * 0.08)));
+      level = "fresh";
       shortText = "Готов";
       statusCode = "ready";
+      if (apps14d > 0 && starts14d === 0) {
+        label = `свежий, выходил только на замену (${readiness}%, ${min14d} мин за 14 дн.)`;
+      } else if (apps14d === 0 && teamRecent14Count > 0) {
+        label = `свежий, не играл в последних ${teamRecent14Count} матчах (${readiness}%)`;
+      } else if (lastSpent > 0) {
+        label = `свежий (${readiness}%, полностью восстановился после прошл. игры −${lastSpent}%${lastReason ? ` — ${lastReason}` : ""})`;
+      } else {
+        label = "свежий (начало игрового отрезка)";
+      }
     }
     const readyToPlay = level !== "exhausted";
-    return { level, label, readiness, readyToPlay, shortText, statusCode, min10d, min14d, apps10d, apps14d, full10d, full14d, starts14d, subApps14d, consecutiveStarts, lastMatchDaysAgo, lastMatchMin };
+    return { level, label, readiness, readyToPlay, shortText, statusCode, isGk, lastSpent, lastReason, lastSource, min10d, min14d, apps10d, apps14d, full10d, full14d, starts14d, subApps14d, consecutiveStarts, lastMatchDaysAgo, lastMatchMin };
   };
   return { forPlayer, teamRecent14Count };
 }
@@ -8943,7 +9337,7 @@ async function buildCtx(f) {
   const headRef = db.referees?.find((r) => r.id === f.refereeId || r.name === f.refereeName) || (f.refereeName ? {
     name: f.refereeName,
     city: "\u0420\u043E\u0441\u0441\u0438\u044F",
-    rating: 7.5,
+    rating: 0,
     bio: `\u0413\u043B\u0430\u0432\u043D\u044B\u0439 \u0430\u0440\u0431\u0438\u0442\u0440 \u0432\u0441\u0442\u0440\u0435\u0447\u0438 \u2014 ${f.refereeName}`,
     matches: 0,
     yellows: 0,
@@ -9038,7 +9432,8 @@ function buildUser(ctx, a, b, st, issues, mode = "full") {
     const rc = ctx.refereeCrew;
     if (!rc || !rc.head) return "\u0421\u0443\u0434\u0435\u0439\u0441\u043A\u0430\u044F \u0431\u0440\u0438\u0433\u0430\u0434\u0430: \u043D\u0430\u0437\u043D\u0430\u0447\u0435\u043D\u0438\u0435 \u043D\u0430 \u043C\u0430\u0442\u0447 \u0441\u0442\u0430\u043D\u0434\u0430\u0440\u0442\u043D\u043E\u0435.";
     const h = rc.head;
-    let s = `\u0413\u043B\u0430\u0432\u043D\u044B\u0439 \u0441\u0443\u0434\u044C\u044F: ${h.name} (${h.city || "\u0420\u0424"}, \u0440\u0435\u0439\u0442\u0438\u043D\u0433 ${h.rating || 7.5}/10).${h.bio ? `\n  Портрет арбитра: ${h.bio}` : ""} \u0421\u0442\u0430\u0442\u0438\u0441\u0442\u0438\u043A\u0430: ${h.matches || 0} \u043C\u0430\u0442\u0447\u0435\u0439, ${h.yellows || 0} \u0416\u041A, ${h.reds || 0} \u041A\u041A, ${h.penalties || 0} \u043F\u0435\u043D\u0430\u043B\u044C\u0442\u0438.`;
+    const refDispRating = Number(h.rating || 0) > 0 ? `${Number(h.rating).toFixed(2)}/10 (ср. в сезоне)` : `${getRefereeSeedRating(h).toFixed(1)}/10 (уровень арбитра, дебют в сезоне)`;
+    let s = `\u0413\u043B\u0430\u0432\u043D\u044B\u0439 \u0441\u0443\u0434\u044C\u044F: ${h.name} (${h.city || "\u0420\u0424"}, ${refDispRating}).${h.bio ? `\n  Портрет арбитра: ${h.bio}` : ""} \u0421\u0442\u0430\u0442\u0438\u0441\u0442\u0438\u043A\u0430: ${h.matches || 0} \u043C\u0430\u0442\u0447\u0435\u0439 \u0433\u043B\u0430\u0432\u043D\u044B\u043C, ${h.yellows || 0} \u0416\u041A, ${h.reds || 0} \u041A\u041A, ${h.penalties || 0} \u043F\u0435\u043D\u0430\u043B\u044C\u0442\u0438.`;
     s += `
   \u041F\u043E\u043C\u043E\u0449\u043D\u0438\u043A\u0438 \u043D\u0430 \u043B\u0438\u043D\u0438\u044F\u0445: 1-\u0439 \u0430\u0441\u0441\u0438\u0441\u0442\u0435\u043D\u0442 \u2014 ${rc.asst1}, 2-\u0439 \u0430\u0441\u0441\u0438\u0441\u0442\u0435\u043D\u0442 \u2014 ${rc.asst2}.`;
     s += `
@@ -9221,7 +9616,8 @@ ${lineText(ctx, "away")}
   }
   if (mode === "light") {
     u += `
-Сгенерируй сводку всего матча (минуты 1–90) строго в валидном JSON без markdown-обёртки: {"events":[...],"stats":{...},"note":"..."}. Прематч и поминутная хроника не нужны.`;
+Сгенерируй сводку всего матча (минуты 1–90) строго в валидном JSON без markdown-обёртки: {"events":[...],"stats":{...},"energy_spent":{"Имя Фамилия":{"spent":число_0_60,"reason":"кратко за какую работу"}},"referee_eval":{"rating":число_5_0_9_5,"summary":"кратко оценка судейства"},"note":"..."}. Прематч и поминутная хроника не нужны.
+ОЦЕНКА ЭНЕРГИИ В "energy_spent": оцени индивидуально каждого игравшего игрока (старт + вышедшие на замену) по ПРОДЕЛАННОЙ РАБОТЕ, НЕ по шаблону минут: вратарь (ВР) почти стоит в воротах и тратит 3–11% (до 15% при шквале сейвов); защитник в низком блоке без беготни — 11–18%; обычный матч полевого — 18–28%; интенсивный прессинг/рывки по бровке/меньшинство — 30–46%; вышедшие в конце — 3–14%.`;
     return u;
   }
   const span = b - a + 1;
@@ -9230,7 +9626,14 @@ ${lineText(ctx, "away")}
   u += ` Ориентир по числу игровых событий в этом отрезке: ${Math.max(12, Math.round(span / 45 * 50))}–${Math.max(22, Math.round(span / 45 * 85))}.`;
   if (a === 1) u += ` Это НАЧАЛО эфира: сначала прематч по разделу 0 (события с отрицательными минутами от -15 до -1 и допустимыми для него типами), затем kickoff на 1-й минуте и игра.`;
   else u += ` Прематч уже прошёл: события с отрицательными минутами НЕ создавай, продолжай ровно с минуты ${a}.`;
-  if (b >= 90) u += ` Это конец матча: заверши событием fulltime; после финального свистка по разделу 0.8 можно добавить 1–3 события (min 90–95, типы crowd | tactical_note | incident).`;
+  if (b >= 90) {
+    u += ` Это конец матча: заверши событием fulltime; после финального свистка по разделу 0.8 можно добавить 1–3 события (min 90–95, типы crowd | tactical_note | incident).
+ОБЯЗАТЕЛЬНЫЙ ИТОГ УСТАЛОСТИ В "state_at_end.energy_spent": оцени персонально каждого игрока, выходившего на поле в этом матче (оба старта и все замены), кто на сколько % устал ИМЕННО ПО ПРОДЕЛАННОЙ РАБОТЕ В МАТЧЕ (НЕ одинаково по минутам!):
+- Формат: "energy_spent": {"Имя Фамилия": {"spent": целое_0_60, "reason": "коротко почему"}}.
+- Вратари (ВР) почти всё время стоят в воротах, мало бегают и мало устают: 3–10% в обычной игре, 11–16% лишь при множестве сейвов/выходов.
+- Если защитник/опорник стоял сзади и мало двигался — 10–17%. Обычный рабочий матч полевого основы — 18–28%. Жёсткий прессинг 90', постоянные рывки по флангу, игра в меньшинстве, тяжёлое поле/жара — 30–46%. Замены в концовке — 3–14%.
+ОЦЕНКА ГЛАВНОГО СУДЬИ В "state_at_end.referee_eval": оцени качество работы главного арбитра ИМЕННО В ЭТОМ МАТЧЕ по 10-балльной шкале (5.0–9.5): {"rating": число, "summary": "кратко за что оценка"}. Закономерная КК или точный пенальти НЕ снижают оценку, если решение верное и игра под контролем.`;
+  }
   return u;
 }
 var PRE_TYPES = new Set("commentator_intro tactical_note stat_display crowd incident lineup walkout anthem coin_toss photo warmup kickoff_buildup".split(" "));
@@ -10042,7 +10445,9 @@ async function genPeriod(a, b, ctx, prev, note, depth = 0) {
         }
       }
       const evs = normalizeEvents(rawEvents, a, b, ctx, prev);
-      return { events: evs, note: r?.state_at_end?.momentum_note || note };
+      const rawEnergy = b >= 90 ? (r?.state_at_end?.energy_spent || r?.state_at_end?.fatigue_report || r?.energy_spent || null) : null;
+      const rawRefEval = b >= 90 ? (r?.state_at_end?.referee_eval || r?.referee_eval || null) : null;
+      return { events: evs, note: r?.state_at_end?.momentum_note || note, energyReport: rawEnergy, refereeReport: rawRefEval };
     } catch (e: any) {
       lastErr = e.message;
       issues = e.message;
@@ -10053,36 +10458,40 @@ async function genPeriod(a, b, ctx, prev, note, depth = 0) {
     const mid = Math.floor((a + b) / 2);
     const r1 = await genPeriod(a, mid, ctx, prev, note, depth + 1);
     const r2 = await genPeriod(mid + 1, b, ctx, prev.concat(r1.events), r1.note, depth + 1);
-    return { events: r1.events.concat(r2.events), note: r2.note, fallback: !!(r1.fallback || r2.fallback) };
+    return { events: r1.events.concat(r2.events), note: r2.note, fallback: !!(r1.fallback || r2.fallback), energyReport: r2.energyReport || r1.energyReport || null, refereeReport: r2.refereeReport || r1.refereeReport || null };
   }
-  throw new Error(`\u0418\u0418 \u043D\u0435 \u0432\u0435\u0440\u043D\u0443\u043B \u043A\u043E\u0440\u0440\u0435\u043A\u0442\u043D\u044B\u0439 \u043F\u0435\u0440\u0438\u043E\u0434 ${a}\u2013${b}: ${lastErr}`);
+  throw new Error(`ИИ не вернул корректный период ${a}–${b}: ${lastErr}`);
 }
 var LIGHT_SYS_ADD = `
 
 ═══ РЕЖИМ СВОДКИ МАТЧА (ПЕРЕОПРЕДЕЛЯЕТ РАЗДЕЛ 10) ═══
-Это матч нижней лиги: поминутная хроника, прематч (раздел 0) и послематчевые реплики не нужны. Учитывай ВСЕ те же данные и правила (составы, форма, тренеры, схемы, погода, газон, судьи, мотивация, турнирное положение), но верни только итог одним JSON: {"events":[...],"stats":{...},"note":"..."}.
+Это матч нижней лиги: поминутная хроника, прематч (раздел 0) и послематчевые реплики не нужны. Учитывай ВСЕ те же данные и правила (составы, форма, тренеры, схемы, погода, газон, судьи, мотивация, турнирное положение), но верни только итог одним JSON: {"events":[...],"stats":{...},"energy_spent":{...},"referee_eval":{"rating":число_5_0_9_5,"summary":"..."},"note":"..."}.
 events — только значимые события всего матча (минуты 1–90): все голы и автоголы (players: [автор, ассистент, если есть]), пенальти, жёлтые и красные карточки, травмы, замены, ошибки судьи/VAR. Не более 30 событий, text — одна короткая строка. Поля min/sec/team/type/players/text — как в разделе 10. Никаких pass/dribble/shot/save/possession.
 stats — {"home":{"shots":int,"shots_on_target":int,"xg":число,"corners":int,"fouls":int,"offsides":int,"tackles":int,"possession":int},"away":{...}}. Цифры согласованы с событиями: удары в створ не меньше голов, удары не меньше ударов в створ, фолов не меньше карточек, владение двух команд в сумме 100.
+energy_spent — {"Имя Фамилия":{"spent":целое_0_60,"reason":"кратко за какую работу"}} для каждого участника матча по реальной работе на поле (ВР: 3–11%, спокойный ЦЗ: 10–18%, обычный полевой: 18–28%, высокий прессинг/рывки: 30–46%, выход в конце: 3–14%).
+referee_eval — {"rating":число_5_0_9_5,"summary":"одно предложение оценки работы судьи в этом матче"}.
 note — одно предложение об игре. Счёт движок считает по событиям goal/own_goal.`;
 async function genLight(ctx) {
-  if (!hasLLM()) return { events: fakePeriod(1, 90, ctx, []), stats: null, note: "", fallback: true };
+  if (!hasLLM()) return { events: fakePeriod(1, 90, ctx, []), stats: null, note: "", energyReport: null, refereeReport: null, fallback: true };
   const sys = (db.settings.systemPrompt || SYS_DEFAULT) + LIGHT_SYS_ADD;
   let issues = "", lastErr = "";
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const user = buildUser(ctx, 1, 90, null, issues, "light") + "\n\nВерни сводку в режиме сводки: JSON {events, stats, note}.";
+      const user = buildUser(ctx, 1, 90, null, issues, "light") + "\n\nВерни сводку в режиме сводки: JSON {events, stats, energy_spent, referee_eval, note}.";
       if (!ctx.prompt1) ctx.prompt1 = user;
       const r = await llmJSON(sys, user, { task: "match-light", temp: 0.9, max: 8e3 });
       const rawEvents = Array.isArray(r) ? r : r?.events || r?.match_events || [];
       const events = normalizeEvents(rawEvents, 1, 90, ctx, [], 0);
-      return { events, stats: r?.stats || null, note: String(r?.note || "") };
+      const rawEnergy = r?.energy_spent || r?.state_at_end?.energy_spent || r?.fatigue_report || null;
+      const rawRefEval = r?.referee_eval || r?.state_at_end?.referee_eval || null;
+      return { events, stats: r?.stats || null, note: String(r?.note || ""), energyReport: rawEnergy, refereeReport: rawRefEval };
     } catch (e: any) {
       lastErr = e.message;
       issues = e.message;
       if (e.noLLM || e.capped) break;
     }
   }
-  throw new Error(`\u0418\u0418 \u043D\u0435 \u0432\u0435\u0440\u043D\u0443\u043B \u0441\u0432\u043E\u0434\u043A\u0443 \u043C\u0430\u0442\u0447\u0430: ${lastErr}`);
+  throw new Error(`ИИ не вернул сводку матча: ${lastErr}`);
 }
 function applyLightStats(st, ls, ctx) {
   if (!ls) return;
@@ -10113,6 +10522,100 @@ function applyLightStats(st, ls, ctx) {
   }
   const ph = n(ls.home?.possession, 25, 75);
   if (ph !== null) st.poss = [ph, 100 - ph];
+}
+function applyMatchEnergyToStats(st, m, f) {
+  if (!st || !st.players) return;
+  const ctx = m?.ctx || {};
+  const events = Array.isArray(m?.events) ? m.events : [];
+  const rawReport = m?.energyReport || m?.energy_spent || null;
+  const aiByPid = new Map<string, { spent: number; reason: string }>();
+  if (rawReport && ctx?.names) {
+    const idx = indexNames(ctx);
+    const activeIdx = idx.filter((x) => (st.players[x.pid]?.min || 0) > 0);
+    const ingestEntry = (nameOrPid: string, val: any, sideHint: string | null = null) => {
+      if (val == null) return;
+      const cleaned = String(nameOrPid || "").replace(/\s*\([^)]*\)\s*$/, "").trim();
+      let pid: string | null = st.players[nameOrPid]
+        ? nameOrPid
+        : resolve(activeIdx, nameOrPid, sideHint) ||
+          (cleaned && cleaned !== nameOrPid ? resolve(activeIdx, cleaned, sideHint) : null) ||
+          resolve(idx, nameOrPid, sideHint) ||
+          (cleaned && cleaned !== nameOrPid ? resolve(idx, cleaned, sideHint) : null);
+      if (!pid) return;
+      const rawNum = typeof val === "number" || typeof val === "string"
+        ? Number(val)
+        : Number(val?.spent ?? val?.energySpent ?? val?.energy_spent ?? val?.fatigue ?? (val?.remaining !== void 0 ? 100 - Number(val.remaining) : NaN));
+      if (!Number.isFinite(rawNum)) return;
+      const reason = typeof val === "object" && val !== null
+        ? String(val.reason || val.work || val.note || val.comment || "").trim().slice(0, 140)
+        : "";
+      aiByPid.set(pid, { spent: rawNum, reason });
+    };
+    if (Array.isArray(rawReport)) {
+      for (const item of rawReport) {
+        if (!item) continue;
+        ingestEntry(String(item.pid || item.id || item.player || item.name || ""), item, item.side || null);
+      }
+    } else if (typeof rawReport === "object") {
+      if (rawReport.home && typeof rawReport.home === "object" && !Array.isArray(rawReport.home)) {
+        for (const [k, v] of Object.entries(rawReport.home)) ingestEntry(k, v, "home");
+      }
+      if (rawReport.away && typeof rawReport.away === "object" && !Array.isArray(rawReport.away)) {
+        for (const [k, v] of Object.entries(rawReport.away)) ingestEntry(k, v, "away");
+      }
+      for (const [k, v] of Object.entries(rawReport)) {
+        if (k === "home" || k === "away") continue;
+        ingestEntry(k, v, null);
+      }
+    }
+  }
+  const actMap: Record<string, { passes: number; dribbles: number; tackles: number; duels: number; shots: number; saves: number; fouls: number }> = {};
+  for (const e of events) {
+    const p0 = e?.pids?.[0];
+    if (!p0) continue;
+    const rec = actMap[p0] ||= { passes: 0, dribbles: 0, tackles: 0, duels: 0, shots: 0, saves: 0, fouls: 0 };
+    if (e.type === "pass") rec.passes++;
+    else if (e.type === "dribble") rec.dribbles++;
+    else if (e.type === "tackle") rec.tackles++;
+    else if (e.type === "duel") rec.duels++;
+    else if (e.type === "shot" || e.type === "goal") rec.shots++;
+    else if (e.type === "save") rec.saves++;
+    else if (e.type === "foul") rec.fouls++;
+  }
+  const wd = f?.weatherDetails || {};
+  const temp = Number(wd?.temp);
+  const weatherMod = (Number.isFinite(temp) && temp >= 27 ? 3 : 0) + (wd?.pitch === "heavy" || wd?.condition === "rain" || wd?.condition === "snow" ? 2.5 : 0);
+  for (const [pid, ps] of Object.entries(st.players) as any[]) {
+    if (!ps || !(ps.min > 0)) continue;
+    const pos = String(ctx?.pos?.[pid] || player(pid)?.pos || "").trim();
+    const isGk = pos === "ВР";
+    const mins = Math.max(1, Math.round(ps.min));
+    const minFrac = clamp(mins / 90, 0.08, 1.25);
+    const ai = aiByPid.get(pid);
+    if (ai) {
+      const maxCap = isGk ? 18 : mins <= 25 ? 24 : mins <= 55 ? 40 : 58;
+      const minCap = isGk ? 2 : mins <= 20 ? 2 : 5;
+      ps.energySpent = clamp(Math.round(ai.spent), minCap, maxCap);
+      ps.energyReason = ai.reason || (isGk ? "оценка ИИ: вратарская нагрузка" : "оценка ИИ по объёму работы в матче");
+      ps.energySource = "ai";
+      continue;
+    }
+    if (isGk) {
+      const sv = Number(ps.sv || actMap[pid]?.saves || 0);
+      const gkActs = (actMap[pid]?.passes || 0) * 0.15;
+      ps.energySpent = clamp(Math.round((4 + sv * 0.65 + gkActs) * Math.min(1.1, Math.max(0.25, minFrac))), 2, 15);
+      ps.energyReason = sv >= 5 ? `активная игра в воротах (${sv} сейвов)` : "спокойная игра в воротах";
+      ps.energySource = "events";
+      continue;
+    }
+    const act = actMap[pid] || { passes: 0, dribbles: 0, tackles: 0, duels: 0, shots: 0, saves: 0, fouls: 0 };
+    const baseByPos = pos === "ЦЗ" ? 13.5 : pos === "ЛЗ" || pos === "ПЗ" || pos === "ОП" ? 17 : pos === "ЦП" || pos === "АП" ? 18 : 17;
+    const work = act.tackles * 1.0 + act.duels * 0.8 + act.dribbles * 0.85 + act.shots * 0.65 + act.fouls * 0.55 + act.passes * 0.25 + (Number(ps.tk || 0) * 0.4);
+    const rawSpent = (baseByPos + work + weatherMod) * minFrac;
+    ps.energySpent = clamp(Math.round(rawSpent), mins <= 20 ? 2 : 6, 48);
+    ps.energyReason = ps.energySpent >= 30 ? "высокая беговая нагрузка и борьба" : ps.energySpent <= 16 ? "экономная игра без лишних рывков" : "средний объём работы";
+    ps.energySource = "events";
+  }
 }
 function computeStats(events, ctx, _unused: any = null) {
   const mk = () => ({ g: 0, sh: 0, sot: 0, xg: 0, fo: 0, co: 0, yc: 0, rc: 0, tk: 0, sv: 0, off: 0, penF: 0, penA: 0, refF: 0, refA: 0, sub: 0 });
@@ -10423,12 +10926,14 @@ async function runMatch(id, opts = {}) {
       const ctx = await buildCtx(f);
       if (!stillValid()) return;
       const light = isLightFx(f);
-      let events = [], note = "", fallback = false, lightStats = null;
+      let events = [], note = "", fallback = false, lightStats = null, energyReport: any = null, refereeReport: any = null;
       if (light) {
         const r = await genLight(ctx);
         events = r.events;
         lightStats = r.stats;
         note = r.note;
+        energyReport = r.energyReport || null;
+        refereeReport = r.refereeReport || null;
         fallback = !!r.fallback;
       } else {
         const periods = db.settings.chunks == 6 ? [[1, 15], [16, 30], [31, 45], [46, 60], [61, 75], [76, 90]] : [[1, 45], [46, 90]];
@@ -10439,6 +10944,8 @@ async function runMatch(id, opts = {}) {
           const r = await genPeriod(a2, b, ctx, events, note);
           events = events.concat(r.events);
           note = r.note;
+          if (r.energyReport) energyReport = r.energyReport;
+          if (r.refereeReport) refereeReport = r.refereeReport;
           fallback = fallback || !!r.fallback;
         }
       }
@@ -10456,7 +10963,7 @@ async function runMatch(id, opts = {}) {
       f.fallback = !!fallback;
       f._ownerId = INSTANCE_ID;
       f._ownerAt = Date.now();
-      await putMatchNow(id, { events, ctx, fallback, light, lightStats });
+      await putMatchNow(id, { events, ctx, fallback, light, lightStats, energyReport, refereeReport });
       if (!stillValid()) return;
       if (light) {
         f.pos = events.length;
@@ -10596,6 +11103,7 @@ function finish(id) {
   f._genToken = null;
   f.st = computeStats(m.events, m.ctx);
   if (m.light) applyLightStats(f.st, m.lightStats, m.ctx);
+  applyMatchEnergyToStats(f.st, m, f);
   m.stats = f.st;
   const HName = tn(f.home), AName = tn(f.away);
   const cH = getCoachForTeam(f.home), cA = getCoachForTeam(f.away);
@@ -10606,7 +11114,7 @@ function finish(id) {
   if ((f.comp === "cup" || f.comp === "supercup") && f.hg === f.ag && !f.pen) f.pen = shootout(f);
   checkPlayoffShootout(f);
   f.status = "done";
-  updateRefereeStats(f, m.events);
+  updateRefereeStats(f, m.events, m);
   if (f.comp === "cup") advanceCup();
   const isFriendlyMatch = f.comp === FRIENDLY_COMP;
   const matchComp = normDiscComp(f.comp);
@@ -15856,6 +16364,7 @@ app.post("/api/esk/resolve", (req, res) => {
     }
     const name = adminName || (req.me?.role === "admin" ? "\u0410\u0434\u043C\u0438\u043D\u0438\u0441\u0442\u0440\u0430\u0442\u043E\u0440 \u042D\u0421\u041A" : "\u041F\u0440\u0435\u0434\u0441\u0435\u0434\u0430\u0442\u0435\u043B\u044C \u043A\u043E\u043C\u0438\u0441\u0441\u0438\u0438");
     const result = resolveEskCase(db, caseId, verdict, comment, name);
+    reconcileRefereeStats();
     save();
     res.json({ ok: 1, ...result });
   } catch (err) {
@@ -17515,7 +18024,8 @@ app.post("/api/admin/budget/award-prizes", admin, (req, res) => {
   }
 }
 app.get("/api/admin/referees", admin, (req, res) => {
-  const list = [...db.referees || []].sort((a, b) => (b.rating || 0) - (a.rating || 0));
+  reconcileRefereeStats();
+  const list = [...db.referees || []].sort((a, b) => (b.rating || 0) - (a.rating || 0) || (b.matches || 0) - (a.matches || 0) || getRefereeSeedRating(b) - getRefereeSeedRating(a));
   res.json({ referees: list, assistants: db.assistants || [] });
 });
 app.post("/api/admin/referees/portfolios-all", admin, async (req, res) => {
@@ -17557,18 +18067,15 @@ app.post("/api/admin/referees/portfolios-all", admin, async (req, res) => {
   res.json({ ok: 1, count: refs.length + assts.length });
 });
 app.get("/api/admin/referee/:id/details", admin, (req, res) => {
+  reconcileRefereeStats();
   const r = (db.referees || []).find((x) => x.id === req.params.id);
   if (!r) return fail(res, "\u0421\u0443\u0434\u044C\u044F \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D");
   const histMap = new Map((r.ratingHistory || []).map((h) => [h.fid, h]));
-  const eskByFid = new Map();
-  for (const c of db.eskCases || []) {
-    if (c.fixtureId || c.matchId) eskByFid.set(c.fixtureId || c.matchId, c);
-  }
   const allFx = db.fixtures || [];
-  const history = [];
+  const history: any[] = [];
   for (const f of allFx) {
     if (f.status !== "done") continue;
-    let roleInMatch = null;
+    let roleInMatch: string | null = null;
     let roleLabel = "";
     if (f.refereeId === r.id || f.refereeName === r.name) {
       roleInMatch = "head";
@@ -17587,19 +18094,30 @@ app.get("/api/admin/referee/:id/details", admin, (req, res) => {
     const tierInfo = classifyMatchTier(f);
     const stored = histMap.get(f.id);
     const matchObj = getMatch(f.id);
-    const evalStats = stored || computeRefereeMatchEval(f, matchObj?.events || []);
-    const eskCase = eskByFid.get(f.id) || (db.eskCases || []).find((c) => c.refereeName === r.name && (c.matchTitle || "").includes(tn(f.home)) && (c.matchTitle || "").includes(tn(f.away)));
+    const evalStats = roleInMatch === "head" && stored?.matchRating !== void 0
+      ? stored
+      : computeRefereeMatchEval(f, matchObj?.events || [], matchObj, stored);
+    const eskList = getFixtureEskCases(f);
+    const eskCase = eskList[0] || null;
     const yc = evalStats.yc || 0;
     const rc = evalStats.rc || 0;
     const penCount = evalStats.pen || 0;
     const fouls = evalStats.fouls || 0;
     const refErr = evalStats.refErr || 0;
     const varChecks = evalStats.varChecks || 0;
-    const disciplineDelta = stored?.disciplineDelta ?? evalStats.disciplineDelta ?? 0;
-    const errorDelta = stored?.errorDelta ?? evalStats.errorDelta ?? 0;
-    const topBonus = stored?.topBonus ?? evalStats.topBonus ?? 0;
-    const rawDelta = +(disciplineDelta + errorDelta + topBonus).toFixed(2);
-    const delta = stored?.delta ?? rawDelta;
+    const varOverturns = evalStats.varOverturns || 0;
+    const eskIncorrect = evalStats.eskIncorrect || 0;
+    const eskDisputable = evalStats.eskDisputable || 0;
+    const eskCorrect = evalStats.eskCorrect || 0;
+    const baseGrade = evalStats.baseGrade ?? (tierInfo.tier === "top" ? 8.05 : tierInfo.tier === "weak" ? 7.8 : 7.9);
+    const controlDelta = evalStats.controlDelta ?? evalStats.disciplineDelta ?? 0;
+    const keyDecisionBonus = evalStats.keyDecisionBonus ?? evalStats.topBonus ?? 0;
+    const varDelta = evalStats.varDelta ?? 0;
+    const errorDelta = evalStats.errorDelta ?? 0;
+    const matchRating = roleInMatch === "head" ? (evalStats.matchRating ?? evalStats.objMatchRating ?? baseGrade) : null;
+    const aiEval = evalStats.aiEval || null;
+    const aiAdjustment = evalStats.aiAdjustment || 0;
+
     history.push({
       fid: f.id,
       season: f.season || S(),
@@ -17630,19 +18148,23 @@ app.get("/api/admin/referee/:id/details", admin, (req, res) => {
       fouls,
       refErr,
       varChecks,
-      disciplineDelta,
+      varOverturns,
+      eskIncorrect,
+      eskDisputable,
+      eskCorrect,
+      baseGrade,
+      controlDelta,
+      keyDecisionBonus,
+      varDelta,
       errorDelta,
-      topBonus,
-      rawDelta,
-      delta,
-      baseBefore: stored?.baseBefore ?? null,
-      ratingAfter: stored?.ratingAfter ?? null,
-      estimatedRating: !(stored && stored.baseBefore !== undefined && stored.ratingAfter !== undefined),
+      aiEval,
+      aiAdjustment,
+      matchRating,
       esk: eskCase ? {
         id: eskCase.id,
         status: eskCase.status,
-        verdict: eskCase.hearing?.verdict || null,
-        verdictSummary: eskCase.hearing?.verdictSummary || null
+        verdict: eskCase.verdict || eskCase.hearing?.verdict || null,
+        verdictSummary: eskCase.officialComment || eskCase.hearing?.verdictSummary || null
       } : null
     });
   }
@@ -17651,66 +18173,53 @@ app.get("/api/admin/referee/:id/details", admin, (req, res) => {
   });
 
   const headDone = history.filter((h) => h.roleInMatch === "head");
-  // Reconstruct sequential rating chain backwards for any legacy matches without ratingHistory
-  let cursorRating = Number(r.rating || 0) > 0 ? Number(r.rating) : 7.5;
-  for (const h of headDone) {
-    if (h.baseBefore !== null && h.ratingAfter !== null) {
-      cursorRating = Number(h.baseBefore);
-    } else {
-      const afterVal = +Math.min(9.9, Math.max(5.5, cursorRating)).toFixed(2);
-      const beforeVal = +Math.min(9.9, Math.max(5.5, afterVal - (h.rawDelta || 0))).toFixed(2);
-      h.ratingAfter = afterVal;
-      h.baseBefore = beforeVal;
-      h.delta = +(afterVal - beforeVal).toFixed(2);
-      cursorRating = beforeVal;
-    }
-  }
 
   for (const h of history) {
     if (h.roleInMatch !== "head") {
       h.ratingFactors = [];
-      h.ratingExplanation = `Отработал матч в роли «${h.roleLabel}». По формуле системы рейтинг главного арбитра пересчитывается только при судействе в поле, поэтому оценка не изменилась.`;
+      h.ratingExplanation = `Отработал матч в роли «${h.roleLabel}». В средний рейтинг главного арбитра засчитываются только матчи в поле.`;
       continue;
     }
-    const discReason = h.rc > 0
-      ? `Удаление в матче (${h.rc} КК, ${h.yc} ЖК, ${h.fouls} фолов) — штраф −0.10 за потерю дисциплинарного контроля.`
-      : h.yc <= 4
-        ? `Спокойный контроль игры (${h.yc} ЖК ≤ 4 и 0 КК, ${h.fouls} фолов) — начислено +0.10.`
-        : `Напряжённый матч без удалений (${h.yc} ЖК > 4 и 0 КК, ${h.fouls} фолов) — начислено +0.05.`;
-    const errReason = h.refErr > 0
-      ? `В протоколе зафиксированы судейские ошибки (${h.refErr} × −0.15 = ${Number(h.errorDelta).toFixed(2)}).${h.esk ? ` Вердикт ЭСК: ${h.esk.verdictSummary || h.esk.status}.` : ""}`
-      : `Грубых судейских ошибок в протоколе не зафиксировано (0) — без штрафа (0.00).${h.varChecks > 0 ? ` Проверок VAR: ${h.varChecks}.` : ""}`;
-    const topReason = h.tier === "top"
-      ? (h.rc === 0 && h.refErr === 0
-        ? `Топовый матч («${h.tierReason}») проведён без удалений и ошибок — дополнительный бонус +0.05.`
-        : `Топовый матч («${h.tierReason}»), но бонус +0.05 не начислен из-за ${h.rc > 0 ? "удаления" : "зафиксированных ошибок"}.`)
-      : `Матч категории «${h.tierLabel}» — бонус за топовый матч не применяется (0.00).`;
+    const baseReason = h.tier === "top"
+      ? `Повышенная ответственность топового матча («${h.tierReason}») — базовая оценка 8.05.`
+      : h.tier === "weak"
+        ? `Рядовой матч («${h.tierReason}») — базовая оценка 7.80.`
+        : `Стандартный матч тура — базовая оценка 7.90.`;
+    const ctrlReason = h.controlDelta >= 0.15
+      ? `Отличный темп и контроль (${h.yc} ЖК, ${h.fouls} фолов) — +0.15.`
+      : h.controlDelta > 0
+        ? `Рабочий контактный матч (${h.yc} ЖК, ${h.fouls} фолов) — +0.05.`
+        : `Много карточек или потеря ритма (${h.yc} ЖК, ${h.fouls} фолов) — ${h.controlDelta.toFixed(2)}.`;
+    const keyReason = h.keyDecisionBonus > 0
+      ? `Сложные ключевые решения (${h.rc ? `${h.rc} КК` : ""}${h.rc && h.penCount ? ", " : ""}${h.penCount ? `${h.penCount} пен.` : ""}${h.eskCorrect ? `${h.rc || h.penCount ? ", " : ""}подтверждено ЭСК` : ""}) приняты уверенно и без ошибок — +${h.keyDecisionBonus.toFixed(2)}.`
+      : (h.rc > 0 || h.penCount > 0)
+        ? `Были ключевые решения (${h.rc} КК, ${h.penCount} пен.), но с замечаниями по протоколу/VAR — +0.00.`
+        : `Решающих эпизодов (КК/пенальти) без ошибок или вердиктов ЭСК в матче не было — +0.00.`;
+    const varReason = h.varOverturns > 0
+      ? `VAR поправлял решения арбитра в поле (${h.varOverturns} пересмотр(а)) — ${h.varDelta.toFixed(2)}.`
+      : h.varChecks > 0 && h.refErr === 0
+        ? `Проверок VAR: ${h.varChecks}, все решения арбитра в поле подтверждены — +0.05.`
+        : `Вмешательств VAR не потребовалось — +0.00.`;
+    const errReason = h.errorDelta < 0
+      ? `Ошибки в протоколе (${h.refErr}) / ЭСК (${h.eskIncorrect} неверн., ${h.eskDisputable} спорн.) — ${h.errorDelta.toFixed(2)}.`
+      : `Грубых ошибок в протоколе и ЭСК не зафиксировано — 0.00.`;
 
-    const unclampedNext = +((Number(h.baseBefore) || 7.5) + (Number(h.rawDelta) || 0)).toFixed(2);
-    const wasClampedHigh = Number(h.ratingAfter) === 9.9 && unclampedNext > 9.9;
-    const wasClampedLow = Number(h.ratingAfter) === 5.5 && unclampedNext < 5.5;
-    h.wasClamped = wasClampedHigh || wasClampedLow;
-    h.clampNote = wasClampedHigh
-      ? `Без учёта потолка получалось ${unclampedNext.toFixed(2)}, итог ограничен максимумом 9.90.`
-      : wasClampedLow
-        ? `Без учёта порога получалось ${unclampedNext.toFixed(2)}, итог ограничен минимумом 5.50.`
-        : "";
     h.ratingFactors = [
-      { key: "discipline", label: "Контроль и дисциплина", delta: Number(h.disciplineDelta || 0), reason: discReason },
-      { key: "errors", label: "Судейские ошибки", delta: Number(h.errorDelta || 0), reason: errReason },
-      { key: "top", label: "Сложность матча (топ-бонус)", delta: Number(h.topBonus || 0), reason: topReason }
+      { key: "base", label: "База по статусу матча", delta: Number(h.baseGrade || 7.9), isBase: true, reason: baseReason },
+      { key: "control", label: "Управление игрой и темп", delta: Number(h.controlDelta || 0), reason: ctrlReason },
+      { key: "key", label: "Ключевые решения (КК/пен./ЭСК)", delta: Number(h.keyDecisionBonus || 0), reason: keyReason },
+      { key: "var", label: "Взаимодействие с VAR", delta: Number(h.varDelta || 0), reason: varReason },
+      { key: "errors", label: "Ошибки арбитра и ЭСК", delta: Number(h.errorDelta || 0), reason: errReason }
     ];
-
-    const summaryParts = [];
-    if (h.rc === 0 && h.refErr === 0) {
-      summaryParts.push(h.yc <= 4 ? "ровное и спокойное судейство без удалений и ошибок" : "справился с напряжённым матчем без удалений и ошибок");
-    } else {
-      if (h.rc > 0) summaryParts.push(`было ${h.rc} КК`);
-      if (h.refErr > 0) summaryParts.push(`допущено ошибок: ${h.refErr}`);
+    if (h.aiEval) {
+      h.ratingFactors.push({
+        key: "ai",
+        label: "Коррекция ИИ-инспектора",
+        delta: Number(h.aiAdjustment || 0),
+        reason: `Оценка инспектора матча: ${Number(h.aiEval.rating).toFixed(2)}${h.aiEval.summary ? ` — ${h.aiEval.summary}` : ""}. Итог: 55% инспектор + 45% протокол.`
+      });
     }
-    if (h.topBonus > 0) summaryParts.push("плюс бонус за чистую работу в топовом матче");
-    const signD = h.delta >= 0 ? "+" : "";
-    h.ratingExplanation = `Рейтинг ${Number(h.ratingAfter).toFixed(2)} (${signD}${Number(h.delta).toFixed(2)} к ${Number(h.baseBefore).toFixed(2)}): ${summaryParts.join(", ")}.${h.clampNote ? " " + h.clampNote : ""}`;
+    h.ratingExplanation = `Оценка за матч: ${Number(h.matchRating).toFixed(2)}${h.aiEval?.summary ? ` — ${h.aiEval.summary}` : ` (протокол ${Number(h.baseGrade + h.controlDelta + h.keyDecisionBonus + h.varDelta + h.errorDelta).toFixed(2)})`}. Все матчи суммируются в средний рейтинг арбитра за сезон.`;
   }
 
   const aggTier = (tierKey) => {
@@ -17732,8 +18241,8 @@ app.get("/api/admin/referee/:id/details", admin, (req, res) => {
       avgPenalties: avg("penCount"),
       avgFouls: avg("fouls"),
       avgErrors: avg("refErr"),
-      avgDelta: n ? +(list.reduce((s, x) => s + (Number(x.delta) || 0), 0) / n).toFixed(2) : 0,
-      cleanCount: list.filter((x) => (x.yc || 0) <= 4 && (x.rc || 0) === 0 && (x.refErr || 0) === 0).length
+      avgRating: n ? +(list.reduce((s, x) => s + (Number(x.matchRating) || 0), 0) / n).toFixed(2) : 0,
+      cleanCount: list.filter((x) => (x.refErr || 0) === 0 && (x.eskIncorrect || 0) === 0 && (x.varOverturns || 0) === 0).length
     };
   };
   const topStats = aggTier("top");
@@ -17744,55 +18253,47 @@ app.get("/api/admin/referee/:id/details", admin, (req, res) => {
     if (!st.matches) {
       return "Отработанных матчей этого уровня пока нет — статистика появится после проведения игр.";
     }
-    const parts = [];
-    if (st.avgYellows >= 5) parts.push(`высокая строгость по карточкам (${st.avgYellows} ЖК/игру)`);
-    else if (st.avgYellows <= 3) parts.push(`мягкий порог карточек (${st.avgYellows} ЖК/игру)`);
+    const parts: string[] = [];
+    parts.push(`средняя оценка ${Number(st.avgRating || 0).toFixed(2)}`);
+    if (st.avgYellows >= 5) parts.push(`строгая планка (${st.avgYellows} ЖК/игру)`);
+    else if (st.avgYellows <= 3) parts.push(`мягкая планка (${st.avgYellows} ЖК/игру)`);
     else parts.push(`ровная планка (${st.avgYellows} ЖК/игру)`);
     if (st.reds > 0) parts.push(`${st.reds} КК в ${st.matches} игр.`);
-    if (st.penalties > 0) parts.push(`${st.penalties} пен.`);
-    if (st.errors > 0) parts.push(`допустил ошибки (${st.errors})`);
-    else parts.push("без зафиксированных грубых ошибок");
+    if (st.errors > 0) parts.push(`ошибки в протоколе (${st.errors})`);
+    else parts.push("без грубых ошибок");
     return parts.join(", ") + ".";
   };
 
   let comparisonSummary = "";
   if (topStats.matches > 0 && weakStats.matches > 0) {
-    const diffY = +(topStats.avgYellows - weakStats.avgYellows).toFixed(2);
-    if (diffY >= 1) comparisonSummary = `В топовых матчах заметно строже, чем в слабых (+${diffY} ЖК за матч: ${topStats.avgYellows} против ${weakStats.avgYellows}).`;
-    else if (diffY <= -1) comparisonSummary = `В слабых матчах выносит больше предупреждений (${weakStats.avgYellows} против ${topStats.avgYellows} в топовых).`;
-    else comparisonSummary = `Держит стабильную планку предупреждений вне зависимости от статуса матча (${topStats.avgYellows} ЖК в топах и ${weakStats.avgYellows} в слабых).`;
+    const diffR = +(topStats.avgRating - weakStats.avgRating).toFixed(2);
+    if (diffR >= 0.25) comparisonSummary = `В топовых матчах получает более высокие оценки (${topStats.avgRating.toFixed(2)} против ${weakStats.avgRating.toFixed(2)} в слабых) — уверенно держит большие игры.`;
+    else if (diffR <= -0.25) comparisonSummary = `В рядовых матчах судит спокойнее и получает выше (${weakStats.avgRating.toFixed(2)} против ${topStats.avgRating.toFixed(2)} в топовых).`;
+    else comparisonSummary = `Показывает ровный уровень оценок в играх любого статуса (${topStats.avgRating.toFixed(2)} в топах и ${weakStats.avgRating.toFixed(2)} в слабых).`;
   } else {
     comparisonSummary = "Сравнение появится после проведения матчей обоих уровней (топовых и слабых).";
   }
 
-  let cleanBonus = 0, tenseBonus = 0, redPenalty = 0, errorPenalty = 0, topBonusSum = 0;
-  for (const h of headDone) {
-    if ((h.disciplineDelta || 0) === 0.1) cleanBonus += 0.1;
-    else if ((h.disciplineDelta || 0) === 0.05) tenseBonus += 0.05;
-    else if ((h.disciplineDelta || 0) < 0) redPenalty += (h.disciplineDelta || 0);
-    errorPenalty += (h.errorDelta || 0);
-    topBonusSum += (h.topBonus || 0);
-  }
-  const totalSimulatedDelta = +(cleanBonus + tenseBonus + redPenalty + errorPenalty + topBonusSum).toFixed(2);
+  const ratingsArr = headDone.map((h) => Number(h.matchRating)).filter((v) => Number.isFinite(v) && v > 0);
+  const avgMatchRating = ratingsArr.length ? +(ratingsArr.reduce((s, v) => s + v, 0) / ratingsArr.length).toFixed(2) : 0;
+  const bestMatchRating = ratingsArr.length ? +Math.max(...ratingsArr).toFixed(2) : 0;
+  const worstMatchRating = ratingsArr.length ? +Math.min(...ratingsArr).toFixed(2) : 0;
   const currentRating = Number(r.rating || 0);
-  const baseStart = headDone.length
-    ? (headDone[headDone.length - 1]?.baseBefore ?? +(currentRating - totalSimulatedDelta).toFixed(2))
-    : currentRating;
 
   res.json({
     referee: r,
     history,
     ratingBreakdown: {
       currentRating: +currentRating.toFixed(2),
-      baseStart: +Number(baseStart).toFixed(2),
+      averageRating: avgMatchRating,
+      bestRating: bestMatchRating,
+      worstRating: worstMatchRating,
+      seedRating: getRefereeSeedRating(r),
+      headMatches: headDone.length,
+      varMatches: (r.varMatches || 0),
+      reserveMatches: (r.reserveMatches || 0),
       recordedMatches: headDone.length,
       otherRoleMatches: history.length - headDone.length,
-      cleanBonus: +cleanBonus.toFixed(2),
-      tenseBonus: +tenseBonus.toFixed(2),
-      redPenalty: +redPenalty.toFixed(2),
-      errorPenalty: +errorPenalty.toFixed(2),
-      topBonus: +topBonusSum.toFixed(2),
-      totalSimulatedDelta,
       averages: {
         ycPerMatch: headDone.length ? +(headDone.reduce((s, x) => s + (x.yc || 0), 0) / headDone.length).toFixed(2) : 0,
         rcPerMatch: headDone.length ? +(headDone.reduce((s, x) => s + (x.rc || 0), 0) / headDone.length).toFixed(2) : 0,
@@ -17801,14 +18302,12 @@ app.get("/api/admin/referee/:id/details", admin, (req, res) => {
         errPerMatch: headDone.length ? +(headDone.reduce((s, x) => s + (x.refErr || 0), 0) / headDone.length).toFixed(2) : 0
       },
       formulaRules: [
-        "Рабочий диапазон рейтинга арбитра: от 5.50 до 9.90 (если исходный рейтинг 0.00, старт в первом матче идёт от базы 7.50).",
-        "Формула за матч главным судьёй: Новый рейтинг = clamp(Текущий + Дисциплина + Ошибки + Топ-бонус, 5.50, 9.90).",
-        "Спокойный контроль (≤ 4 ЖК и 0 КК в матче): +0.10 к рейтингу.",
-        "Напряжённый матч (> 4 ЖК, но без удалений): +0.05 к рейтингу.",
-        "Удаление в матче (КК > 0): −0.10 к рейтингу.",
-        "Зафиксированная ошибка арбитра в протоколе (ref_error): −0.15 за каждую ошибку.",
-        "Бонус за топовый матч / дерби (без удалений и ошибок): +0.05 дополнительно.",
-        "В роли VAR / AVAR / резервного рейтинг главного арбитра не пересчитывается."
+        "Сезонный рейтинг арбитра = среднее арифметическое его оценок за все проведённые матчи в роли главного судьи (пока матчей 0 — рейтинг 0.00).",
+        "Каждый матч оценивается отдельно в диапазоне 5.00–9.50: база (7.80 рядовой / 7.90 обычный / 8.05 топовый) + управление игрой + ключевые решения + VAR − ошибки/ЭСК, в сочетании с оценкой ИИ-инспектора матча (55% ИИ + 45% протокол).",
+        "Заслуженные красные карточки и точные пенальти НЕ штрафуются — наоборот, точные ключевые решения без ошибок и пересмотров VAR дают +0.15.",
+        "Пересмотр решения через VAR снижает оценку (−0.25 за пересмотр), подтверждение VAR без ошибок даёт +0.05.",
+        "Зафиксированная судейская ошибка (ref_error) или признанная ошибка по вердикту ЭСК снижает оценку матча на 0.85 балла.",
+        "Матчи в роли VAR, AVAR и резервного судьи учитываются отдельно в статистике бригад и не размывают оценку работы главным арбитром в поле."
       ]
     },
     tierComparison: {
@@ -17825,15 +18324,21 @@ app.post("/api/admin/referee", admin, (req, res) => {
   if (id) {
     const r = db.referees.find((x) => x.id === id);
     if (!r) return fail(res, "\u0421\u0443\u0434\u044C\u044F \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D");
+    const numRating = rating !== undefined && rating !== "" && Number.isFinite(Number(rating)) ? Number(rating) : null;
+    const ratingEdited = numRating !== null && Math.abs(numRating - Number(r.rating || 0)) > 0.001;
     Object.assign(r, {
       name: name || r.name,
       city: city !== undefined ? city : r.city,
       age: age2 !== undefined && age2 !== "" ? Number(age2) || r.age : r.age,
       varRole: varRole !== undefined ? varRole : r.varRole,
       leagues: Array.isArray(leagues) ? leagues : r.leagues,
-      rating: rating !== undefined && rating !== "" && Number.isFinite(Number(rating)) ? Number(rating) : r.rating,
       bio: bio !== undefined ? bio : r.bio
     });
+    if (ratingEdited && numRating !== null && !(r.matches > 0)) {
+      r.rating = numRating;
+      if (numRating > 0) r.manualRating = true;
+      else delete r.manualRating;
+    }
     delete r.style;
     delete r.styleDesc;
     delete r.topMatchNote;
@@ -17841,21 +18346,25 @@ app.post("/api/admin/referee", admin, (req, res) => {
     save();
     return res.json({ ok: 1, referee: r });
   } else {
-    const newRef = {
+    const initR = rating !== undefined && rating !== "" && Number.isFinite(Number(rating)) ? Number(rating) : 0;
+    const newRef: any = {
       id: "ref_" + uid(),
       name,
       city: city || "\u041C\u043E\u0441\u043A\u0432\u0430",
       age: Number(age2) || 38,
       varRole: varRole || "",
       leagues: Array.isArray(leagues) && leagues.length ? leagues : ["rpl", "cup"],
-      rating: rating !== undefined && rating !== "" && Number.isFinite(Number(rating)) ? Number(rating) : 0,
+      rating: initR,
       matches: 0,
+      varMatches: 0,
+      reserveMatches: 0,
       yellows: 0,
       reds: 0,
       penalties: 0,
       bio: bio || "\u0410\u0440\u0431\u0438\u0442\u0440 \u0420\u041F\u041B \u0438 \u041A\u0443\u0431\u043A\u0430 \u0420\u043E\u0441\u0441\u0438\u0438.",
       ratingHistory: []
     };
+    if (initR > 0) newRef.manualRating = true;
     db.referees.push(newRef);
     save();
     return res.json({ ok: 1, referee: newRef });
@@ -17867,7 +18376,11 @@ app.post("/api/admin/assistant", admin, (req, res) => {
   if (!a) return fail(res, "\u041F\u043E\u043C\u043E\u0449\u043D\u0438\u043A \u0441\u0443\u0434\u044C\u0438 \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D");
   if (name) a.name = name;
   if (bio !== undefined) a.bio = String(bio);
-  if (rating !== undefined && rating !== "" && Number.isFinite(Number(rating))) a.rating = Number(rating);
+  if (rating !== undefined && rating !== "" && Number.isFinite(Number(rating)) && !(a.matches > 0)) {
+    a.rating = Number(rating);
+    if (a.rating > 0) a.manualRating = true;
+    else delete a.manualRating;
+  }
   save();
   res.json({ ok: 1, assistant: a });
 });
@@ -17986,6 +18499,7 @@ app.post("/api/admin/fixture/referee", admin, (req, res) => {
     putMatch(f.id, cachedMatch);
   }
 
+  if (f.status === "done") reconcileRefereeStats();
   save();
   res.json({
     ok: 1,
@@ -18034,6 +18548,34 @@ app.post("/api/admin/referees/assign-round", admin, (req, res) => {
   assignTourReferees(matches, true);
   save();
   res.json({ ok: 1, count: matches.length });
+});
+app.post("/api/admin/referees/reassign-upcoming", admin, (req, res) => {
+  reconcileRefereeStats();
+  const tours: Record<string, any[]> = {};
+  for (const f of db.fixtures || []) {
+    if ((f.season || S()) !== S()) continue;
+    if (f.comp !== "rpl" && f.comp !== "cup") continue;
+    if (f.status !== "scheduled" || f.manualReferees) continue;
+    const k = getFixtureTourKey(f);
+    tours[k] = tours[k] || [];
+    tours[k].push(f);
+  }
+  const sortedTours = Object.values(tours).sort((a, b) => {
+    const ad = String(a[0]?.date || "9999-99-99");
+    const bd = String(b[0]?.date || "9999-99-99");
+    return ad.localeCompare(bd) || (Number(a[0]?.round || 0) - Number(b[0]?.round || 0));
+  });
+  let count = 0;
+  const uniqueHeads = /* @__PURE__ */ new Set();
+  for (const list of sortedTours) {
+    assignTourReferees(list, true);
+    for (const f of list) {
+      count++;
+      if (f.refereeId) uniqueHeads.add(f.refereeId);
+    }
+  }
+  save();
+  res.json({ ok: 1, count, uniqueHeadRefs: uniqueHeads.size });
 });
 function getMediaCupGroups() {
   const mFx = seasonFx().filter((f) => f.comp === "media_cup" && !f.cupStage);

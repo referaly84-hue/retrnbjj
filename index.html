@@ -7860,17 +7860,22 @@ function renderFatigueBadge(fat, available, unavailReason, opts = {}) {
   const f = fat || { level: 'fresh', readiness: 100, shortText: 'Готов', label: 'свежий (начало игрового отрезка)' };
   const pct = Math.max(0, Math.min(100, Math.round(Number(f.readiness ?? (f.level === 'exhausted' ? 40 : f.level === 'tired' ? 65 : f.level === 'moderate' ? 84 : 100)))));
   let ico = '🔋', statusTxt = f.shortText || 'Готов', bg = '#f0fdf4', fg = '#15803d', bd = '#86efac', bar = '#16a34a', hint = 'полностью готов к матчу';
-  if (f.level === 'exhausted') {
+  if (f.isGk) {
+    ico = '🧤';
+    hint = f.lastSpent ? `вратарь · прошл. игра −${f.lastSpent}%${f.lastReason ? ` (${f.lastReason})` : ''}` : 'вратарь · минимальный расход сил';
+  } else if (f.level === 'exhausted') {
     ico = '🔥'; statusTxt = f.shortText || 'Истощён'; bg = '#fef2f2'; fg = '#b91c1c'; bd = '#fca5a5'; bar = '#dc2626';
-    hint = 'нужен отдых · риск просадки после 65\'';
+    hint = f.lastSpent ? `прошл. игра −${f.lastSpent}%${f.lastReason ? ` · ${f.lastReason}` : ''} · нужен отдых` : 'нужен отдых · риск просадки после 65\'';
   } else if (f.level === 'tired') {
     ico = '😓'; statusTxt = f.shortText || 'Устал'; bg = '#fffbeb'; fg = '#b45309'; bd = '#fcd34d'; bar = '#f59e0b';
-    hint = 'высокая нагрузка · спад во 2-м тайме';
+    hint = f.lastSpent ? `прошл. игра −${f.lastSpent}%${f.lastReason ? ` · ${f.lastReason}` : ''} · спад во 2-м тайме` : 'высокая нагрузка · спад во 2-м тайме';
   } else if (f.level === 'moderate') {
     ico = '⚡'; statusTxt = f.shortText || 'В тонусе'; bg = '#f0fdfa'; fg = '#0f766e'; bd = '#99f6e4'; bar = '#14b8a6';
-    hint = `${f.min14d || 0} мин за 14 дн. · готов играть`;
+    hint = f.lastSpent ? `прошл. игра −${f.lastSpent}%${f.lastReason ? ` (${f.lastReason})` : ''} · готов играть` : `${f.min14d || 0} мин за 14 дн. · готов играть`;
   } else if (f.apps14d > 0 && f.starts14d === 0) {
     hint = `свежий (${f.min14d} мин со скамейки)`;
+  } else if (f.lastSpent) {
+    hint = `восстановился (прошл. игра −${f.lastSpent}%${f.lastReason ? ` · ${f.lastReason}` : ''})`;
   }
   const tip = f.label ? `${statusTxt} (${pct}%) — ${f.label}` : `${statusTxt} (${pct}%)`;
   if (compact) {
@@ -9671,44 +9676,49 @@ async function pgAdmin(app) {
       </div>
       <div class="panel wrap">
         <h3>Таблица рейтинга главных и резервных арбитров (${refs.length})</h3>
-        <p class="muted small">Нажмите на фамилию арбитра или «Профиль», чтобы написать портрет вручную, посмотреть подробный рейтинг за каждый матч, историю отработанных игр и статистику на топовых и слабых матчах (доступно только вам как админу).</p>
+        <p class="muted small">Рейтинг арбитра — среднее арифметическое его оценок за матчи в роли главного судьи. Нажмите на фамилию арбитра или «Профиль», чтобы посмотреть оценки по каждой игре, историю в поле и на VAR.</p>
         <table>
-          <thead><tr><th>#</th><th class="l">Арбитр</th><th class="l">Город</th><th>Матчи</th><th>ЖК</th><th>КК</th><th>Пен.</th><th>Рейтинг</th><th></th></tr></thead>
+          <thead><tr><th>#</th><th class="l">Арбитр</th><th class="l">Город</th><th>Гл. матчи</th><th>ЖК</th><th>КК</th><th>Пен.</th><th>Ср. рейтинг</th><th></th></tr></thead>
           <tbody>
-            ${refs.map((r, i) => `<tr>
+            ${refs.map((r, i) => {
+              const extraRoles = (r.varMatches || 0) + (r.reserveMatches || 0);
+              const ratingDisp = (Number(r.matches || 0) > 0 || Number(r.rating || 0) > 0) ? Number(r.rating || 0).toFixed(2) : '—';
+              return `<tr>
               <td><b>${i + 1}</b></td>
               <td class="l">
                 <a href="javascript:void(0)" data-rfp="${r.id}" style="font-weight:700;color:var(--deep);text-decoration:underline;text-underline-offset:3px">${e(r.name)}</a>
                 ${r.varRole ? ` <span class="tag">${e(r.varRole)}</span>` : ''}
+                ${r.role && r.role !== 'Главный арбитр' ? ` <span class="tag" style="background:#f1f5f9;color:#475569">${e(r.role)}</span>` : ''}
               </td>
               <td class="l">${e(r.city)}</td>
-              <td>${r.matches || 0}</td>
+              <td><b>${r.matches || 0}</b>${extraRoles > 0 ? `<div class="small muted">ВАР/рез: ${extraRoles}</div>` : ''}</td>
               <td>${r.yellows || 0}</td>
               <td>${r.reds || 0}</td>
               <td>${r.penalties || 0}</td>
-              <td><b>${Number(r.rating || 0).toFixed(2)}</b></td>
+              <td><b>${ratingDisp}</b></td>
               <td><button class="btn alt sm" data-rfp="${r.id}">Профиль и история</button></td>
-            </tr>`).join('')}
+            </tr>`;
+            }).join('')}
           </tbody>
         </table>
       </div>
       <div class="panel wrap">
         <h3>Помощники судьи (${assts.length})</h3>
         <table>
-          <thead><tr><th>#</th><th class="l">Помощник</th><th>Матчи</th><th>Рейтинг</th><th></th></tr></thead>
+          <thead><tr><th>#</th><th class="l">Помощник</th><th>Матчи</th><th>Ср. рейтинг</th><th></th></tr></thead>
           <tbody>
             ${assts.map((a, i) => `<tr>
               <td>${i + 1}</td>
               <td class="l"><a href="javascript:void(0)" data-asp="${a.id}" style="font-weight:700;color:var(--deep);text-decoration:underline;text-underline-offset:3px">${e(a.name)}</a></td>
               <td>${a.matches || 0}</td>
-              <td><b>${Number(a.rating || 0).toFixed(2)}</b></td>
+              <td><b>${(Number(a.matches || 0) > 0 || Number(a.rating || 0) > 0) ? Number(a.rating || 0).toFixed(2) : '—'}</b></td>
               <td><button class="btn alt sm" data-asp="${a.id}">Портрет / профиль</button></td>
             </tr>`).join('')}
           </tbody>
         </table>
       </div>
       <div class="panel" style="margin-top:14px">
-        <h3 style="margin:0 0 8px">Назначение судей на тур (по рейтингу и с учётом города)</h3>
+        <h3 style="margin:0 0 8px">Назначение судей на туры (сбалансированная ротация и учёт города)</h3>
         <div class="row" style="gap:8px;flex-wrap:wrap">
           <select id="rf_assign_comp" style="width:auto">
             <option value="rpl">РПЛ</option>
@@ -9716,7 +9726,9 @@ async function pgAdmin(app) {
           </select>
           <input id="rf_assign_round" type="number" min="1" value="1" style="width:90px" placeholder="Тур №"/>
           <button class="btn" id="rf_assign_btn">Назначить судей на тур</button>
+          <button class="btn alt" id="rf_reassign_btn" type="button">🔄 Перераспределить будущие туры</button>
         </div>
+        <p class="small muted" style="margin:6px 0 0">Кнопка «Перераспределить будущие туры» равномерно распределяет всех главных арбитров РПЛ/Кубка на ещё не сыгранные туры без ручных правок.</p>
       </div>
       <div class="panel" style="margin-top:14px">
         <h3 style="margin:0 0 6px">⚖️ Назначение бригады арбитров на отдельный матч</h3>
@@ -9790,6 +9802,16 @@ async function pgAdmin(app) {
       const r = await act(() => api('/admin/referees/assign-round', { comp, round }), `Судьи назначены на тур ${round}`);
       if (r) re();
     };
+    const rfReassignBtn = $('#rf_reassign_btn');
+    if (rfReassignBtn) {
+      rfReassignBtn.onclick = async () => {
+        const res = await act(() => api('/admin/referees/reassign-upcoming', {}));
+        if (res) {
+          toast(`Перераспределено матчей: ${res.count || 0} · задействовано главных судей: ${res.uniqueHeadRefs || 0}`);
+          re();
+        }
+      };
+    }
     $('#rf_all_bio').onclick = async () => {
       const r = await act(() => api('/admin/referees/portfolios-all', {}), 'Портреты всех арбитров и ассистентов обновлены');
       if (r) re();
@@ -9864,7 +9886,7 @@ async function pgAdmin(app) {
       const renderRatingMatches = () => {
         const list = history.filter(h => ratingFilter === 'head' ? h.roleInMatch === 'head' : true);
         if (!history.length) {
-          return '<div class="empty">Отработанных матчей пока нет — подробный разбор рейтинга по каждой игре появится после первого проведённого матча.</div>';
+          return '<div class="empty">Отработанных матчей пока нет — подробная оценка за каждую игру появится после первого проведённого матча.</div>';
         }
         if (!list.length) {
           return '<div class="empty">Матчей в роли главного судьи пока нет. Переключите фильтр на «Все отработанные», чтобы увидеть игры в других ролях.</div>';
@@ -9882,20 +9904,16 @@ async function pgAdmin(app) {
                   <div class="row" style="gap:6px">
                     ${tierBadge(h.tier, h.tierReason)}
                     <span class="tag">${e(h.roleLabel)}</span>
-                    <span class="tag" style="background:#e2e8f0;color:#334155">Δ 0.00</span>
+                    <span class="tag" style="background:#e2e8f0;color:#334155">без оценки гл. судьи</span>
                   </div>
                 </div>
                 <div class="small muted">${e(h.ratingExplanation || '')}</div>
               </div>`;
             }
-            const dVal = Number(h.delta || 0);
-            const dColor = dVal > 0 ? '#15803d' : dVal < 0 ? '#b91c1c' : '#475569';
-            const dBg = dVal > 0 ? '#ecfdf5' : dVal < 0 ? '#fef2f2' : '#f1f5f9';
-            const dBorder = dVal > 0 ? '#86efac' : dVal < 0 ? '#fca5a5' : '#cbd5e1';
-            const beforeNum = Number(h.baseBefore ?? 7.5);
-            const afterNum = Number(h.ratingAfter ?? beforeNum);
-            const unclamped = +(beforeNum + Number(h.rawDelta || 0)).toFixed(2);
-            const formulaStr = `${beforeNum.toFixed(2)} ${Number(h.disciplineDelta) >= 0 ? '+' : '−'} ${Math.abs(Number(h.disciplineDelta || 0)).toFixed(2)} (дисц.) ${Number(h.errorDelta) >= 0 ? '+' : '−'} ${Math.abs(Number(h.errorDelta || 0)).toFixed(2)} (ошибки) ${Number(h.topBonus) >= 0 ? '+' : '−'} ${Math.abs(Number(h.topBonus || 0)).toFixed(2)} (топ) = ${unclamped.toFixed(2)}${h.wasClamped ? ` → ${afterNum.toFixed(2)} (порог)` : ''}`;
+            const mr = Number(h.matchRating ?? h.baseGrade ?? 7.9);
+            const gColor = mr >= 7.8 ? '#15803d' : mr < 7.0 ? '#b91c1c' : '#334155';
+            const gBg = mr >= 7.8 ? '#ecfdf5' : mr < 7.0 ? '#fef2f2' : '#f1f5f9';
+            const gBorder = mr >= 7.8 ? '#86efac' : mr < 7.0 ? '#fca5a5' : '#cbd5e1';
             return `<div style="border:1px solid var(--line);border-radius:10px;padding:12px;background:#fff">
               <div class="row sp" style="gap:8px;flex-wrap:wrap;margin-bottom:8px">
                 <div>
@@ -9906,25 +9924,21 @@ async function pgAdmin(app) {
                     ${e(fmtD(h.date || ''))}${h.time ? ` ${e(h.time)}` : ''} · ${e(h.label || h.comp)} · ${tierBadge(h.tier, h.tierReason)} <span style="margin-left:4px">${e(h.tierReason || '')}</span>
                   </div>
                 </div>
-                <div style="display:flex;align-items:center;gap:6px;background:${dBg};border:1px solid ${dBorder};border-radius:8px;padding:6px 10px">
-                  <span class="small muted">Было <b>${beforeNum.toFixed(2)}</b></span>
-                  <span style="font-weight:800;color:${dColor}">${fmtSigned(dVal)}</span>
-                  <span class="small muted">→ Стало <b style="color:var(--deep);font-size:14px">${afterNum.toFixed(2)}</b></span>
+                <div style="display:flex;align-items:center;gap:6px;background:${gBg};border:1px solid ${gBorder};border-radius:8px;padding:6px 10px">
+                  <span class="small muted">Оценка за матч:</span>
+                  <b style="color:${gColor};font-size:15px">${mr.toFixed(2)}</b>
                 </div>
-              </div>
-
-              <div class="small" style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:6px 9px;margin-bottom:8px;font-family:monospace">
-                ${e(formulaStr)}${h.estimatedRating ? ' <span class="tag" style="font-family:sans-serif;margin-left:6px">восстановлено по протоколу</span>' : ''}
               </div>
 
               <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:8px;margin-bottom:8px">
                 ${(h.ratingFactors || []).map(f => {
                   const fv = Number(f.delta || 0);
-                  const fc = fv > 0 ? '#15803d' : fv < 0 ? '#b91c1c' : '#475569';
+                  const valTxt = f.isBase ? fv.toFixed(2) : fmtSigned(fv);
+                  const fc = f.isBase ? '#1e293b' : (fv > 0 ? '#15803d' : fv < 0 ? '#b91c1c' : '#475569');
                   return `<div style="border:1px solid var(--line);border-radius:6px;padding:7px 9px;background:#fcfcfd">
                     <div class="row sp" style="margin-bottom:3px">
                       <b class="small">${e(f.label)}</b>
-                      <b class="small" style="color:${fc}">${fmtSigned(fv)}</b>
+                      <b class="small" style="color:${fc}">${valTxt}</b>
                     </div>
                     <div class="small muted" style="line-height:1.4">${e(f.reason)}</div>
                   </div>`;
@@ -9932,7 +9946,7 @@ async function pgAdmin(app) {
               </div>
 
               <div class="small" style="padding:7px 10px;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;color:#14532d">
-                <b>Почему такой рейтинг:</b> ${e(h.ratingExplanation || '')}
+                <b>Разбор оценки:</b> ${e(h.ratingExplanation || '')}
               </div>
             </div>`;
           }).join('')}
@@ -9962,16 +9976,17 @@ async function pgAdmin(app) {
             <th>КК</th>
             <th>Пен.</th>
             <th>Ошибки</th>
-            <th>Рейтинг Δ</th>
+            <th>Оценка</th>
           </tr></thead>
           <tbody>
             ${filtered.map(h => {
               const scoreTxt = `<b>${h.hg} : ${h.ag}</b>${h.pen ? ` <span class="small muted">(пен. ${h.pen[0]}:${h.pen[1]})</span>` : ''}`;
-              const deltaTxt = h.roleInMatch === 'head' && h.delta !== null
-                ? `<b style="color:${h.delta >= 0 ? '#15803d' : '#b91c1c'}">${h.delta >= 0 ? '+' : ''}${Number(h.delta).toFixed(2)}</b>${h.ratingAfter !== null ? `<div class="small muted">→ ${Number(h.ratingAfter).toFixed(2)}</div>` : ''}`
+              const mr = h.roleInMatch === 'head' && h.matchRating != null ? Number(h.matchRating) : null;
+              const gradeTxt = mr !== null
+                ? `<b style="color:${mr >= 7.8 ? '#15803d' : mr < 7.0 ? '#b91c1c' : '#334155'}">${mr.toFixed(2)}</b>${h.errorDelta < 0 ? `<div class="small muted">штраф ${Number(h.errorDelta).toFixed(2)}</div>` : ''}`
                 : '<span class="muted">—</span>';
               const eskTxt = h.esk
-                ? `<div class="small" style="margin-top:3px;color:${h.esk.verdict === 'error_confirmed' ? '#b91c1c' : '#1e40af'}">ЭСК: ${e(h.esk.verdictSummary || h.esk.status)}</div>`
+                ? `<div class="small" style="margin-top:3px;color:${(h.esk.verdict === 'error_confirmed' || h.esk.verdict === 'incorrect') ? '#b91c1c' : '#1e40af'}">ЭСК: ${e(h.esk.verdictSummary || h.esk.status)}</div>`
                 : '';
               return `<tr>
                 <td class="l" style="white-space:nowrap">
@@ -9991,7 +10006,7 @@ async function pgAdmin(app) {
                 <td>${h.rc ?? 0}</td>
                 <td>${h.penCount ?? 0}</td>
                 <td>${h.refErr ? `<b style="color:#b91c1c">${h.refErr}</b>` : '0'}</td>
-                <td>${deltaTxt}</td>
+                <td>${gradeTxt}</td>
               </tr>`;
             }).join('')}
           </tbody>
@@ -10001,6 +10016,8 @@ async function pgAdmin(app) {
       const renderModalBody = () => {
         const box = m.firstElementChild;
         if (!box) return;
+        const hasMainRating = Number(r.matches || 0) > 0 || Number(r.rating || 0) > 0;
+        const extraRoleCount = (r.varMatches || 0) + (r.reserveMatches || 0);
         box.innerHTML = `
           <div class="row sp" style="align-items:flex-start;gap:10px;margin-bottom:10px">
             <div>
@@ -10008,6 +10025,7 @@ async function pgAdmin(app) {
                 <h3 style="margin:0;font-size:19px">${e(r.name)}</h3>
                 <span class="tag" style="background:#fef3c7;color:#92400e;font-weight:700">🔒 Только для админа</span>
                 ${r.varRole ? `<span class="tag">${e(r.varRole)}</span>` : ''}
+                ${r.role && r.role !== 'Главный арбитр' ? `<span class="tag" style="background:#f1f5f9;color:#475569">${e(r.role)}</span>` : ''}
               </div>
               <div class="small muted" style="margin-top:4px">
                 Город: <b>${e(r.city || '—')}</b> · Возраст: <b>${r.age || 40} лет</b> · Лиги: <b>${(r.leagues || []).join(', ').toUpperCase() || '—'}</b>
@@ -10018,12 +10036,14 @@ async function pgAdmin(app) {
 
           <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(115px,1fr));gap:8px;margin-bottom:14px">
             <div style="background:var(--soft);border:1px solid var(--line);border-radius:8px;padding:8px 10px">
-              <div class="small muted">Рейтинг</div>
-              <div style="font-size:18px;font-weight:800;color:var(--deep)">${Number(r.rating || 0).toFixed(2)}</div>
+              <div class="small muted">Средний рейтинг</div>
+              <div style="font-size:18px;font-weight:800;color:var(--deep)">${hasMainRating ? Number(r.rating || 0).toFixed(2) : '—'}</div>
+              ${!(r.matches > 0) && rb.seedRating ? `<div class="small muted">класс до старта: ${Number(rb.seedRating).toFixed(2)}</div>` : ''}
             </div>
             <div style="background:var(--soft);border:1px solid var(--line);border-radius:8px;padding:8px 10px">
-              <div class="small muted">Отработано матчей</div>
-              <div style="font-size:18px;font-weight:800">${r.matches || 0} <span class="small muted" style="font-weight:500">(${history.length} в истории)</span></div>
+              <div class="small muted">Главным судьёй</div>
+              <div style="font-size:18px;font-weight:800">${r.matches || 0}</div>
+              <div class="small muted">ВАР/рез.: ${extraRoleCount} · всего: ${history.length}</div>
             </div>
             <div style="background:var(--soft);border:1px solid var(--line);border-radius:8px;padding:8px 10px">
               <div class="small muted">ЖК / КК</div>
@@ -10055,9 +10075,9 @@ async function pgAdmin(app) {
                 <label style="margin-top:2px">Возраст</label>
                 <input id="rf_age_inp" type="number" min="22" max="65" value="${r.age || 40}">
               </div>
-              <div style="width:110px">
-                <label style="margin-top:2px">Рейтинг</label>
-                <input id="rf_rating_inp" type="number" step="0.05" min="0" max="9.9" value="${Number(r.rating || 0).toFixed(2)}">
+              <div style="width:140px">
+                <label style="margin-top:2px">Рейтинг ${r.matches > 0 ? '(авто)' : '(до 1-го матча)'}</label>
+                <input id="rf_rating_inp" type="number" step="0.05" min="0" max="9.9" value="${Number(r.rating || 0).toFixed(2)}" ${r.matches > 0 ? 'disabled title="После начала сезона рейтинг считается автоматически как среднее оценок за матчи"' : ''}>
               </div>
               <div style="flex:1;min-width:120px">
                 <label style="margin-top:2px">Роль VAR</label>
@@ -10074,29 +10094,25 @@ async function pgAdmin(app) {
             <div class="panel" style="background:#f8fafc;margin-bottom:12px">
               <h4 style="margin:0 0 8px">🧮 Как именно считается рейтинг арбитра</h4>
               <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin-bottom:10px">
-                <div style="background:#fff;border:1px solid var(--line);border-radius:8px;padding:8px">
-                  <div class="small muted">Стартовая база</div>
-                  <b>${Number(rb.baseStart ?? r.rating ?? 0).toFixed(2)}</b>
-                </div>
-                <div style="background:#fff;border:1px solid var(--line);border-radius:8px;padding:8px">
-                  <div class="small muted">Спокойные игры (+0.10)</div>
-                  <b style="color:#15803d">+${Number(rb.cleanBonus || 0).toFixed(2)}</b>
-                </div>
-                <div style="background:#fff;border:1px solid var(--line);border-radius:8px;padding:8px">
-                  <div class="small muted">Напряжённые (+0.05)</div>
-                  <b style="color:#0369a1">+${Number(rb.tenseBonus || 0).toFixed(2)}</b>
-                </div>
-                <div style="background:#fff;border:1px solid var(--line);border-radius:8px;padding:8px">
-                  <div class="small muted">Удаления / Ошибки</div>
-                  <b style="color:#b91c1c">${Number((rb.redPenalty || 0) + (rb.errorPenalty || 0)).toFixed(2)}</b>
-                </div>
-                <div style="background:#fff;border:1px solid var(--line);border-radius:8px;padding:8px">
-                  <div class="small muted">Бонус за топ-матчи</div>
-                  <b style="color:#7c3aed">+${Number(rb.topBonus || 0).toFixed(2)}</b>
-                </div>
                 <div style="background:#ecfdf5;border:1px solid #86efac;border-radius:8px;padding:8px">
-                  <div class="small muted">Итоговый рейтинг</div>
-                  <b style="color:#166534">${Number(rb.currentRating ?? r.rating ?? 0).toFixed(2)}</b>
+                  <div class="small muted">Средний рейтинг (сезон)</div>
+                  <b style="color:#166534">${(rb.headMatches > 0 || rb.currentRating > 0) ? Number(rb.currentRating ?? r.rating ?? 0).toFixed(2) : '—'}</b>
+                </div>
+                <div style="background:#fff;border:1px solid var(--line);border-radius:8px;padding:8px">
+                  <div class="small muted">Главных матчей</div>
+                  <b>${rb.headMatches ?? r.matches ?? 0}</b>
+                </div>
+                <div style="background:#fff;border:1px solid var(--line);border-radius:8px;padding:8px">
+                  <div class="small muted">Лучшая оценка</div>
+                  <b style="color:#15803d">${Number(rb.bestRating || 0) > 0 ? Number(rb.bestRating).toFixed(2) : '—'}</b>
+                </div>
+                <div style="background:#fff;border:1px solid var(--line);border-radius:8px;padding:8px">
+                  <div class="small muted">Худшая оценка</div>
+                  <b style="color:${Number(rb.worstRating || 0) > 0 && Number(rb.worstRating) < 7.0 ? '#b91c1c' : '#334155'}">${Number(rb.worstRating || 0) > 0 ? Number(rb.worstRating).toFixed(2) : '—'}</b>
+                </div>
+                <div style="background:#fff;border:1px solid var(--line);border-radius:8px;padding:8px">
+                  <div class="small muted">ВАР / Резервный</div>
+                  <b>${rb.varMatches ?? r.varMatches ?? 0} / ${rb.reserveMatches ?? r.reserveMatches ?? 0}</b>
                 </div>
               </div>
               <div class="small muted" style="margin-bottom:8px">
@@ -10109,7 +10125,7 @@ async function pgAdmin(app) {
 
             <div class="panel" style="background:#fff;margin-bottom:0">
               <div class="row sp" style="gap:8px;margin-bottom:10px;flex-wrap:wrap">
-                <h4 style="margin:0">📋 Разбор рейтинга по каждой отработанной игре</h4>
+                <h4 style="margin:0">📋 Разбор оценок по каждой отработанной игре</h4>
                 <div class="row" style="gap:6px" id="rf_rating_filters">
                   <button type="button" class="btn sm ${ratingFilter === 'head' ? '' : 'alt'}" data-rfm="head">Главным (${history.filter(x => x.roleInMatch === 'head').length})</button>
                   <button type="button" class="btn sm ${ratingFilter === 'all' ? '' : 'alt'}" data-rfm="all">Все отработанные (${history.length})</button>
@@ -10135,7 +10151,7 @@ async function pgAdmin(app) {
                     <div>ЖК / матч: <b>${topSt.avgYellows ?? 0}</b> (всего ${topSt.yellows || 0})</div>
                     <div>КК / матч: <b>${topSt.avgReds ?? 0}</b> (всего ${topSt.reds || 0}) · Пен.: <b>${topSt.penalties || 0}</b></div>
                     <div>Фолы / матч: <b>${topSt.avgFouls ?? 0}</b> · Ошибки: <b style="color:${(topSt.errors || 0) > 0 ? '#b91c1c' : '#15803d'}">${topSt.errors || 0}</b></div>
-                    <div>Ср. дельта рейтинга: <b style="color:${(topSt.avgDelta || 0) >= 0 ? '#15803d' : '#b91c1c'}">${(topSt.avgDelta || 0) >= 0 ? '+' : ''}${Number(topSt.avgDelta || 0).toFixed(2)}</b></div>
+                    <div>Средняя оценка: <b style="color:${Number(topSt.avgRating || 0) >= 7.8 ? '#15803d' : (Number(topSt.avgRating || 0) > 0 && Number(topSt.avgRating) < 7.0) ? '#b91c1c' : '#334155'}">${topSt.matches > 0 ? Number(topSt.avgRating || 0).toFixed(2) : '—'}</b></div>
                   </div>
                   <div class="small muted" style="margin-top:8px;padding-top:8px;border-top:1px solid #fecaca">${e(topSt.assessment || '')}</div>
                 </div>
@@ -10148,12 +10164,12 @@ async function pgAdmin(app) {
                     <div>ЖК / матч: <b>${weakSt.avgYellows ?? 0}</b> (всего ${weakSt.yellows || 0})</div>
                     <div>КК / матч: <b>${weakSt.avgReds ?? 0}</b> (всего ${weakSt.reds || 0}) · Пен.: <b>${weakSt.penalties || 0}</b></div>
                     <div>Фолы / матч: <b>${weakSt.avgFouls ?? 0}</b> · Ошибки: <b style="color:${(weakSt.errors || 0) > 0 ? '#b91c1c' : '#15803d'}">${weakSt.errors || 0}</b></div>
-                    <div>Ср. дельта рейтинга: <b style="color:${(weakSt.avgDelta || 0) >= 0 ? '#15803d' : '#b91c1c'}">${(weakSt.avgDelta || 0) >= 0 ? '+' : ''}${Number(weakSt.avgDelta || 0).toFixed(2)}</b></div>
+                    <div>Средняя оценка: <b style="color:${Number(weakSt.avgRating || 0) >= 7.8 ? '#15803d' : (Number(weakSt.avgRating || 0) > 0 && Number(weakSt.avgRating) < 7.0) ? '#b91c1c' : '#334155'}">${weakSt.matches > 0 ? Number(weakSt.avgRating || 0).toFixed(2) : '—'}</b></div>
                   </div>
                   <div class="small muted" style="margin-top:8px;padding-top:8px;border-top:1px solid #cbd5e1">${e(weakSt.assessment || '')}</div>
                 </div>
               </div>
-              <div class="small muted" style="margin-top:8px">Обычных (средних) отработанных матчей в истории: <b>${midSt.matches || 0}</b> (среднее ЖК/матч: ${midSt.avgYellows ?? 0}, КК: ${midSt.reds || 0}, ср. дельта: ${(midSt.avgDelta || 0) >= 0 ? '+' : ''}${Number(midSt.avgDelta || 0).toFixed(2)}).</div>
+              <div class="small muted" style="margin-top:8px">Обычных (средних) отработанных матчей в истории: <b>${midSt.matches || 0}</b> (среднее ЖК/матч: ${midSt.avgYellows ?? 0}, КК: ${midSt.reds || 0}, ср. оценка: ${midSt.matches > 0 ? Number(midSt.avgRating || 0).toFixed(2) : '—'}).</div>
             </div>
           </div>
 
