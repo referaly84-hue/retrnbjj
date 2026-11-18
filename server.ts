@@ -16708,8 +16708,8 @@ app.post("/api/club/lineup", needClub, (req, res) => {
     slots: slotRes.entries.map((e) => ({ slot: e.slotPos, pid: e.pid })),
     roles,
     plannedSubs,
-    speech: String(req.body.speech || "").slice(0, 4e3),
-    training: String(req.body.training || "").slice(0, 4e3),
+    speech: String(req.body.speech || "").slice(0, 20000),
+    training: String(req.body.training || "").slice(0, 10000),
     at: Date.now()
   };
   db.lineups[f.id + ":" + req.tid] = L;
